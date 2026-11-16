@@ -1340,6 +1340,11 @@ function parseBlocks(src, refs) {
     // ---- Phase 1: descend into open containers. ----
     let pos = 0, col = 0, pad = 0;
     let failAt = -1;
+    // Column advance of the innermost container matched, and whether it
+    // was a blockquote (mirrors contentAt): a tab after the markers
+    // expands by the innermost quote marker's own width, not the
+    // absolute column (doc-17: `  > \tindented` is 2 spaces).
+    let lastDelta = 0, lastWasQuote = false;
     for (let s = 1; s < stack.length; s++) {
       const b = stack[s];
       if (b.t === 'para') break;
@@ -1358,6 +1363,8 @@ function parseBlocks(src, refs) {
       if (b.t === 'quote') {
         const m = matchQuoteMarker(line, pos, col, pad);
         if (!m) { failAt = s; break; }
+        lastDelta = m.col - col;
+        lastWasQuote = true;
         pos = m.pos; col = m.col; pad = m.pad;
       } else if (b.t === 'item') {
         // An empty item followed by a blank line is closed: its content
@@ -1367,6 +1374,8 @@ function parseBlocks(src, refs) {
         const ind = indentFrom(line, pos, col, pad);
         if (ind.col < want) { failAt = s; break; }
         const adv = advanceTo(line, pos, col, pad, want);
+        lastDelta = adv.col - col;
+        lastWasQuote = false;
         pos = adv.pos; col = adv.col; pad = adv.pad;
       }
     }
@@ -1452,6 +1461,21 @@ function parseBlocks(src, refs) {
     }
     let content = (pos === 0 && pad === 0) ? line : (' '.repeat(pad) + line.slice(pos));
     let ccol = col;
+    // A leading tab in the content after container markers expands to
+    // spaces (its width at the marker column): `> \tindented` in a
+    // paragraph is 2 spaces, not a literal tab (doc-17/doc-40). For a
+    // blockquote innermost, only that marker's own width counts
+    // (lastDelta), not the absolute column — `  > \tindented` is 2
+    // spaces, not 4. Spaces are kept verbatim; only tabs expand.
+    if (pos > 0 && content.length > 0 && content.slice(0, content.search(/[^ \t]/) < 0 ? content.length : content.search(/[^ \t]/)).includes('\t')) {
+      const effCol = lastWasQuote ? lastDelta : ccol;
+      let out = '', c2 = effCol, j = 0;
+      while (j < content.length && (content[j] === ' ' || content[j] === '\t')) {
+        if (content[j] === ' ') { out += ' '; c2++; j++; }
+        else { const w = 4 - (c2 % 4); out += ' '.repeat(w); c2 += w; j++; }
+      }
+      content = out + content.slice(j);
+    }
     // ---- Phase 2: start new blocks (possibly several containers). ----
     while (true) {
       const paraOpen = stack.length > 0 && stack[stack.length - 1].t === 'para';
