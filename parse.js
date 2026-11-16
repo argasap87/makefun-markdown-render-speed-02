@@ -2393,13 +2393,14 @@ function parseInlineNodes(text, refs) {
         if (dm.active && (dm.kind === '[' || dm.kind === '![') && dm.src >= 0) {
           labelEnd = findLabelEnd(text, dm.src + 1);
           // The guard only applies when the link would actually form: a
-          // label with an unclosed code span (doc-35 `[run ``response`]`)
-          // never forms a link, so a code span opening inside it must
-          // not be blocked — it swallows the `]`. Strict pairing here
-          // (same-length run closes): the lenient label scan pairs
-          // `` `` `` with a single backtick, but the code-span
-          // tokenizer does not, so the `` `` `` is unclosed.
-          if (labelEnd >= 0) labelUnclosed = labelHasUnclosedSpanStrict(text.slice(dm.src + 1, labelEnd - 1));
+          // label with an unclosed code span (lenient pairing — a run
+          // closes at the first run of any length, as in marked's label
+          // regex) never forms a link, so a code span opening inside it
+          // must not be blocked. (A strict-pairing check here broke
+          // doc-09: `[docs each ``url`](...) forms its link, and the
+          // single backtick must not open a code span that swallows
+          // the `]`.)
+          if (labelEnd >= 0) labelUnclosed = labelHasUnclosedSpan(text.slice(dm.src + 1, labelEnd - 1));
           break;
         }
       }
