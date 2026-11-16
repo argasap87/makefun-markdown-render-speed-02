@@ -2829,13 +2829,19 @@ function parseHtmlBlock(P, i, stack, hb, content, ccol, lastBlank, lastBlankDept
     const c = contentAt(P, k, stack);
     rawLines.push(c ? c.content : '');
   }
-  // Trailing newline: present iff the block is followed by a non-blank
-  // line inside its containers, or (at EOF) the block is top-level and the
-  // source ends with a newline. Inside a container at EOF there is none.
+  // Trailing newline (delimited types 1-5 only: script/pre/style,
+  // comment, PI, declaration, CDATA — all end at a closing marker):
+  // present iff the block is followed by a line that is not completely
+  // empty — a whitespace-only line (space or tab) counts (doc-15: a
+  // tab-only line after `-->` keeps the trailing newline), but a truly
+  // empty line does not. Tag blocks (types 6-7) never have one. At EOF
+  // it depends on the source ending with a newline at top level.
   let trailingNL = false;
   if (hb.endLine < P.n - 1) {
-    const nx = contentAt(P, hb.endLine + 1, stack);
-    trailingNL = !!nx && !isBlankFrom(nx.content, 0);
+    if (hb.type <= 5) {
+      const nx = contentAt(P, hb.endLine + 1, stack);
+      trailingNL = !!nx && nx.content.length > 0;
+    }
   } else {
     trailingNL = stack.length === 1 && P.endsNL;
   }
