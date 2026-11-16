@@ -1701,17 +1701,28 @@ function parseInlineNodes(text, refs) {
       if (!closer.active || closer.kind === '[' || closer.kind === '![' ||
           !closer.canClose) { d += step; continue; }
       // Find the nearest opener before d (same length first in pass 1).
+      // Pass 1 fallback: if no same-length opener exists, a PURE closer
+      // (canClose, cannot open) may split the nearest LONGER opener (use
+      // 1), so `__foo_ bar_` forms the inner em before the outer closer
+      // grabs the opener (cm-408/413/426/430). A closer that can also open
+      // must NOT split: it serves as an opener for a later closer
+      // (cm-429 `**foo*bar*baz**`: the `*` after `foo` opens `<em>bar</em>`).
       let o = -1;
+      let fallback = -1;
       for (let j = d - 1; j >= 0; j--) {
         const op = delims[j];
         if (!op.active || op.kind !== closer.kind || !op.canOpen) continue;
-        if (sameLengthOnly && op.len !== closer.len) continue;
+        if (sameLengthOnly && op.len !== closer.len) {
+          if (fallback < 0 && !closer.canOpen && op.len > closer.len) fallback = j;
+          continue;
+        }
         if (closer.kind === '_' &&
             ((op.canOpen && op.canClose) || (closer.canOpen && closer.canClose)) &&
             (op.len + closer.len) % 3 === 0) continue;
         o = j;
         break;
       }
+      if (o < 0 && sameLengthOnly && fallback >= 0) o = fallback;
       if (o < 0) { d += step; continue; }
       const opener = delims[o];
       // Earlier-closer priority (both passes): if an earlier PURE closer
