@@ -18,6 +18,20 @@ function isDigit(ch) { return ch >= '0' && ch <= '9'; }
 function isAlphaNum(ch) {
   return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || isDigit(ch);
 }
+// Case-insensitive prefix match at s[i], without allocating a
+// lower-cased copy (the hot path in matchBareAutolink, probed at every
+// word starting with h/f/w/m/x). Only ASCII letters fold; ':' '/' '.'
+// compare exactly.
+function startsWithCI(s, i, lit) {
+  for (let k = 0; k < lit.length; k++) {
+    const a = s.charCodeAt(i + k);
+    const b = lit.charCodeAt(k);
+    if (a === b) continue;
+    if (b >= 97 && b <= 122 && a === b - 32) continue;
+    return false;
+  }
+  return true;
+}
 function isWhite(ch) { return ch === ' ' || ch === '\t'; }
 
 // Escape text for HTML output. When encode is false, an ampersand that
@@ -1000,20 +1014,23 @@ function htmlBlockStart(P, i, pos, col, inPara) {
 function splitTableRow(s) {
   const cells = [];
   const n = s.length;
-  // Fast path: no `\|` escapes — a plain split on `|`.
+  // Fast path: no `\|` escapes — walk the pipes with indexOf and slice
+  // each cell once (trimmed), instead of split('|') which allocates an
+  // array plus one string per part before trimming.
   if (s.indexOf('\\|') < 0) {
-    const parts = s.split('|');
-    // A leading pipe (first part only whitespace) is not a cell; a
-    // trailing pipe (last part only whitespace) is not a cell.
-    let startIdx = 0;
-    if (parts[0].trim() === '') startIdx = 1;
-    let endIdx = parts.length;
-    if (parts.length > 0 && parts[parts.length - 1].trim() === '') endIdx = parts.length - 1;
-    if (startIdx >= endIdx) {
-      // The whole row is whitespace (or just pipes): one empty cell.
-      return parts.length === 1 ? [''] : [];
+    let start = 0;
+    let p = s.indexOf('|');
+    if (p < 0) return [s.trim()];
+    while (p >= 0) {
+      cells.push(s.slice(start, p).trim());
+      start = p + 1;
+      p = s.indexOf('|', start);
     }
-    for (let p = startIdx; p < endIdx; p++) cells.push(parts[p].trim());
+    cells.push(s.slice(start).trim());
+    // A leading pipe (first cell only whitespace) is not a cell; a
+    // trailing pipe (last cell only whitespace) is not a cell.
+    if (cells.length > 0 && cells[0] === '') cells.shift();
+    if (cells.length > 0 && cells[cells.length - 1] === '') cells.pop();
     return cells;
   }
   // Slow path: a `|` is a cell separator unless preceded by an ODD
@@ -1905,10 +1922,15 @@ function parseInlineNodes(text, refs) {
   const delims = [];
   const n = text.length;
   let i = 0;
+  // Hoisted per-paragraph probes: the email check needs an '@' in the
+  // text, and the trailing-underscore check needs an '_' opener; a
+  // paragraph without them skips those scans entirely.
+  const hasAt = text.includes('@');
+  const hasUnderscore = text.includes('_');
 
   function addText(s) { if (s) nodes.push({ t: 'text', s }); }
   function pushDelim(kind, len, canOpen, canClose, node, src) {
-    delims.push({ kind, len, canOpen, canClose, node, active: true, src: src === undefined ? -1 : src });
+    delims.push({ kind, len, canOpen, canClose, node, active: true, src: src === undefined ? -1 : src, hasLink: false });
   }
   // Resolve emphasis for the delimiters currently on the stack, in two
   // passes. Pass 1 pairs only same-length openers/closers (so `**` pairs
@@ -2176,13 +2198,18 @@ function parseInlineNodes(text, refs) {
   // a run with no partner is bare. Code-span inner backticks become '+'
   // and escaped punctuation becomes '++' in the transformed string (all
   // replacements length-preserving, so indices still match the source).
+  // The replacements are recorded as intervals and the result is
+  // assembled from slices: a paragraph with no backticks and no
+  // backslashes returns the source string itself (no copy at all), and
+  // one with replacements avoids the per-character array + join.
   function maskTransform(s) {
-    const t = s.split('');
+    if (!s.includes('`') && !s.includes('\\')) return s;
     const n = s.length;
+    const reps = [];
     let i = 0;
     while (i < n) {
       const c = s[i];
-      if (c === '\\' && i + 1 < n && isPunct(s[i + 1])) { t[i] = '+'; t[i + 1] = '+'; i += 2; continue; }
+      if (c === '\\' && i + 1 < n && isPunct(s[i + 1])) { reps.push([i, i + 2]); i += 2; continue; }
       if (c !== '`') { i++; continue; }
       let run = 0;
       while (i + run < n && s[i + run] === '`') run++;
@@ -2199,10 +2226,26 @@ function parseInlineNodes(text, refs) {
         } else j++;
       }
       if (close < 0) { i += run; continue; }
-      for (let k = i + run; k < close - run; k++) if (t[k] === '`') t[k] = '+';
+      for (let k = i + run; k < close - run;) {
+        if (s[k] === '`') {
+          let m = k;
+          while (m < close - run && s[m] === '`') m++;
+          reps.push([k, m]);
+          k = m;
+        } else k++;
+      }
       i = close;
     }
-    return t.join('');
+    if (reps.length === 0) return s;
+    const parts = [];
+    let last = 0;
+    for (const [a, b] of reps) {
+      if (a > last) parts.push(s.slice(last, a));
+      parts.push('+'.repeat(b - a));
+      last = b;
+    }
+    if (last < n) parts.push(s.slice(last));
+    return parts.join('');
   }
 
   // Try to match marked's blockSkip link at t[p] === '[': a label of
@@ -2323,10 +2366,6 @@ function parseInlineNodes(text, refs) {
     }
     return ranges;
   }
-
-  // Blanked emphasis-mask ranges for this paragraph (computed once;
-  // they depend only on the paragraph text).
-  const maskRanges = emphasisMaskRanges();
 
   // Try to form a link/image at the current ']' (index i). Returns the
   // index just past the link syntax, or -1 when no link forms.
@@ -2463,6 +2502,16 @@ function parseInlineNodes(text, refs) {
       nodes.push({ t: 'image', src: href, alt: plainText(textNodes), title });
     } else {
       nodes.push({ t: 'link', href, title, children: textNodes });
+      // An explicit link inside an open label marks every enclosing
+      // label: a later bare-URL probe in that label reads hasLink in
+      // O(1) instead of scanning the nodes for a link (the scan it
+      // replaces). Bare/angle autolinks do not count, so only this
+      // explicit-link path marks. The opener itself was already
+      // removed from delims above; the remaining active '[' openers
+      // are exactly the enclosing labels.
+      for (const dm of delims) {
+        if (dm.active && (dm.kind === '[' || dm.kind === '![')) dm.hasLink = true;
+      }
     }
     return endIdx;
   }
@@ -2709,15 +2758,10 @@ function parseInlineNodes(text, refs) {
       for (let q = delims.length - 1; q >= 0; q--) {
         const dm = delims[q];
         if (dm.active && (dm.kind === '[' || dm.kind === '![')) {
-          const opIdx = nodes.indexOf(dm.node);
-          let hasLink = false;
-          if (opIdx >= 0) {
-            for (let k = opIdx + 1; k < nodes.length; k++) {
-              const nd = nodes[k];
-              if (nd.t === 'link' && !nd.bare && !nd.angle) { hasLink = true; break; }
-              if (nd.children && containsLink(nd.children)) { hasLink = true; break; }
-            }
-          }
+          // hasLink is maintained by finishLink: an explicit link was
+          // created inside this label. (A bare/angle autolink inside
+          // does not count, and finishLink does not mark for those.)
+          const hasLink = !!dm.hasLink;
           if (!hasLink && dm.src >= 0) {
             const le = findLabelEnd(text, dm.src + 1);
             if (le >= 0 && !labelHasUnclosedSpan(text.slice(dm.src + 1, le - 1))) {
@@ -2745,13 +2789,15 @@ function parseInlineNodes(text, refs) {
         continue;
       }
     }
-    if (!inLink && isAlphaNum(c) && (i === 0 || !isEmailLocal(text[i - 1]))) {
+    if (!inLink && hasAt && isAlphaNum(c) && (i === 0 || !isEmailLocal(text[i - 1]))) {
       // A trailing `_` is an emphasis closer (not an email char) when
       // there is an active `_` opener that can pair with it.
       let allowU = false;
-      for (let q = delims.length - 1; q >= 0; q--) {
-        const dm = delims[q];
-        if (dm.active && dm.kind === '_' && dm.canOpen) { allowU = true; break; }
+      if (hasUnderscore) {
+        for (let q = delims.length - 1; q >= 0; q--) {
+          const dm = delims[q];
+          if (dm.active && dm.kind === '_' && dm.canOpen) { allowU = true; break; }
+        }
       }
       const em = matchEmail(text, i, allowU);
       if (em) {
@@ -2799,11 +2845,13 @@ function parseInlineNodes(text, refs) {
       const prev = j > 0 ? text[j - 1] : '';
       if (!inLink && (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F' || ch === 'w' || ch === 'W' || ch === 'm' || ch === 'M' || ch === 'x' || ch === 'X') && !isAlphaNum(prev) &&
           matchBareAutolink(text, j)) break;
-      if (!inLink && isAlphaNum(ch) && !isEmailLocal(prev)) {
+      if (!inLink && hasAt && isAlphaNum(ch) && !isEmailLocal(prev)) {
         let allowU = false;
-        for (let q = delims.length - 1; q >= 0; q--) {
-          const dm = delims[q];
-          if (dm.active && dm.kind === '_' && dm.canOpen) { allowU = true; break; }
+        if (hasUnderscore) {
+          for (let q = delims.length - 1; q >= 0; q--) {
+            const dm = delims[q];
+            if (dm.active && dm.kind === '_' && dm.canOpen) { allowU = true; break; }
+          }
         }
         if (matchEmail(text, j, allowU)) break;
       }
@@ -2831,11 +2879,20 @@ function parseInlineNodes(text, refs) {
   // emphasisMaskRanges): marked never pairs them (doc-09/16/28/35).
   // Link-text delimiters are already scoped out (finishLink splices
   // them into their own range), so only top-level delimiters remain.
-  if (maskRanges.length > 0) {
-    for (const dm of delims) {
-      if (!dm.active || (dm.kind !== '*' && dm.kind !== '_' && dm.kind !== '~')) continue;
-      for (const [a, b] of maskRanges) {
-        if (dm.src > a && dm.src < b) { dm.active = false; break; }
+  // The mask is computed lazily: a paragraph with no emphasis
+  // delimiters skips the whole pass (maskTransform + scans).
+  let hasEmDelim = false;
+  for (const dm of delims) {
+    if (dm.active && (dm.kind === '*' || dm.kind === '_' || dm.kind === '~')) { hasEmDelim = true; break; }
+  }
+  if (hasEmDelim) {
+    const maskRanges = emphasisMaskRanges();
+    if (maskRanges.length > 0) {
+      for (const dm of delims) {
+        if (!dm.active || (dm.kind !== '*' && dm.kind !== '_' && dm.kind !== '~')) continue;
+        for (const [a, b] of maskRanges) {
+          if (dm.src > a && dm.src < b) { dm.active = false; break; }
+        }
       }
     }
   }
@@ -2882,17 +2939,16 @@ function isEmailLocal(ch) {
 function matchBareAutolink(text, i, inLabel) {
   if (i > 0 && isAlphaNum(text[i - 1])) return null;
   let scheme = null;
-  const low = text.slice(i, i + 8).toLowerCase();
-  if (low.startsWith('http://')) scheme = text.slice(i, i + 7);
-  else if (low.startsWith('https://')) scheme = text.slice(i, i + 8);
-  else if (low.startsWith('ftp://')) scheme = text.slice(i, i + 6);
-  else if (low.startsWith('mailto:')) {
+  if (startsWithCI(text, i, 'http://')) scheme = text.slice(i, i + 7);
+  else if (startsWithCI(text, i, 'https://')) scheme = text.slice(i, i + 8);
+  else if (startsWithCI(text, i, 'ftp://')) scheme = text.slice(i, i + 6);
+  else if (startsWithCI(text, i, 'mailto:')) {
     // mailto:email — the whole `mailto:foo@bar.baz` is one link.
     const em = matchEmail(text, i + 7);
     if (!em) return null;
     const url = text.slice(i, i + 7) + em.text;
     return { end: i + 7 + em.text.length, href: url, text: url };
-  } else if (low.startsWith('xmpp:')) {
+  } else if (startsWithCI(text, i, 'xmpp:')) {
     // xmpp:email[/resource] — one optional `/segment` resource.
     const em = matchEmail(text, i + 5);
     if (!em) return null;
