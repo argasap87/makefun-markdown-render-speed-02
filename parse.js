@@ -1611,17 +1611,20 @@ function renderBlocks(node, refs) {
   return out.join('');
 }
 
-function renderNode(node, refs, out) {
+function renderNode(node, refs, out, lastTrail) {
   switch (node.t) {
     case 'doc':
-      for (const child of node.children) renderNode(child, refs, out);
+      for (let c = 0; c < node.children.length; c++)
+        renderNode(node.children[c], refs, out, lastTrail && c === node.children.length - 1);
       break;
     case 'heading':
       out.push('<h', String(node.level), '>', renderInline(node.text, refs), '</h', String(node.level), '>\n');
       break;
-    case 'para':
-      out.push('<p>', renderInline(node.text, refs), '</p>\n');
+    case 'para': {
+      const text = lastTrail ? node.text.replace(/[ \t]+$/, '') : node.text;
+      out.push('<p>', renderInline(text, refs), '</p>\n');
       break;
+    }
     case 'code':
       out.push('<pre><code');
       if (node.fenced && node.info) {
@@ -1635,7 +1638,8 @@ function renderNode(node, refs, out) {
       break;
     case 'quote':
       out.push('<blockquote>\n');
-      for (const child of node.children) renderNode(child, refs, out);
+      for (let c = 0; c < node.children.length; c++)
+        renderNode(node.children[c], refs, out, lastTrail && c === node.children.length - 1);
       out.push('</blockquote>\n');
       break;
     case 'list': {
@@ -1643,7 +1647,8 @@ function renderNode(node, refs, out) {
       out.push('<', tag);
       if (node.ordered && node.start !== 1) out.push(' start="', String(node.start), '"');
       out.push('>\n');
-      for (const item of node.items) renderItem(item, node, refs, out);
+      for (let i = 0; i < node.items.length; i++)
+        renderItem(node.items[i], node, refs, out, i === node.items.length - 1);
       out.push('</', tag, '>\n');
       break;
     }
@@ -1683,8 +1688,12 @@ function renderNode(node, refs, out) {
 }
 
 // Render one list item. Tight: a lone paragraph renders as bare inline
-// content; loose: every paragraph gets <p> wrappers.
-function renderItem(item, list, refs, out) {
+// content; loose: every paragraph gets <p> wrappers. `lastTrail` is true
+// when this item is the last item of its list (and that list is itself
+// the last descendant of its parent): trailing spaces are stripped from
+// the item's final paragraph, even when it is nested inside a blockquote
+// (doc-28) — the flag propagates to the last descendant.
+function renderItem(item, list, refs, out, lastTrail) {
   out.push('<li>');
   const kids = item.children;
   const hasTask = item._task !== undefined;
@@ -1693,18 +1702,20 @@ function renderItem(item, list, refs, out) {
     : '';
   for (let k = 0; k < kids.length; k++) {
     const child = kids[k];
+    const isLastKid = k === kids.length - 1;
     if (child.t === 'para') {
+      const text = (lastTrail && isLastKid) ? child.text.replace(/[ \t]+$/, '') : child.text;
       if (list.tight) {
         if (k === 0) out.push(box);
-        out.push(renderInline(child.text, refs));
+        out.push(renderInline(text, refs));
       } else {
         out.push('<p>');
         if (k === 0) out.push(box);
-        out.push(renderInline(child.text, refs));
+        out.push(renderInline(text, refs));
         out.push('</p>\n');
       }
     } else {
-      renderNode(child, refs, out);
+      renderNode(child, refs, out, lastTrail && isLastKid);
     }
   }
   out.push('</li>\n');
