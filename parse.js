@@ -261,6 +261,13 @@ function findLabelEnd(s, start) {
   // A label ends at the FIRST unescaped `]` (code spans aside). Nested
   // brackets do NOT extend it: `[ref[bar]]` has label `ref[bar`, so it
   // matches no definition (cm-547); `[[[foo]]]` likewise (cm-548).
+  // A code span inside a label closes at the FIRST backtick run after
+  // the opening, of ANY length (marked's label regex is lenient about
+  // run lengths, and a `]` inside the span's content does not end the
+  // label): `[not a `link](/foo`]` skips the span so the `]` inside
+  // does not end it (cm-342); `[docs each ``url`]` closes the span at
+  // the single backtick, so the `]` right after ends the label
+  // (doc-09). If no closing run exists, the backticks are literal.
   const n = s.length;
   let i = start;
   while (i < n) {
@@ -268,8 +275,20 @@ function findLabelEnd(s, start) {
     if (c === '`') {
       let k = i;
       while (k < n && s[k] === '`') k++;
-      const run = k - i;
-      const close = findCodeEnd(s, k, run);
+      // First backtick run after the opening (any length). A ']' in
+      // between is span content, not a label end.
+      let j = k;
+      let close = -1;
+      while (j < n) {
+        if (s[j] === '`') {
+          let m = j;
+          while (m < n && s[m] === '`') m++;
+          close = m;
+          break;
+        }
+        if (s[j] === '\\' && j + 1 < n) { j += 2; continue; }
+        j++;
+      }
       if (close < 0) { i = k; continue; }
       i = close; continue;
     }
@@ -1063,11 +1082,14 @@ function contentAt(P, li, stack) {
   const line = P.lines[li];
   let pos = 0, col = 0, pad = 0;
   let stripped = false;
-  // Number of blockquote levels stripped: inner '>' markers do not
-  // contribute to the tab-expansion column (marked expands a boundary
-  // tab as if only the outermost '> ' counted, so '> > \t' is 2 spaces,
-  // not 4). Track it to compute the effective column below.
-  let quoteDepth = 0;
+  // Column advance of the innermost (last) container stripped, and
+  // whether it was a blockquote: a boundary tab expands using only
+  // the innermost blockquote marker's own width ('> ' = 2, plus any
+  // leading spaces before that '>'), while for a list item the
+  // absolute column counts. E.g. '> > \t' and '  > \t' (item+quote)
+  // both expand to 2 spaces; '> - \t' (item innermost) uses the
+  // absolute column.
+  let lastDelta = 0, lastWasQuote = false;
   for (let s = 1; s < stack.length; s++) {
     const b = stack[s];
     if (b.t === 'para') break;
@@ -1075,9 +1097,10 @@ function contentAt(P, li, stack) {
     if (b.t === 'quote') {
       const m = matchQuoteMarker(line, pos, col, pad);
       if (!m) return null;
+      lastDelta = m.col - col;
+      lastWasQuote = true;
       pos = m.pos; col = m.col; pad = m.pad;
       stripped = true;
-      quoteDepth++;
     } else if (b.t === 'item') {
       // _contentIndent is relative to the column after the containers
       // before this item (blockquote columns shift per line).
@@ -1085,6 +1108,8 @@ function contentAt(P, li, stack) {
       const ind = indentFrom(line, pos, col, pad);
       if (ind.col < want) return null;
       const adv = advanceTo(line, pos, col, pad, want);
+      lastDelta = adv.col - col;
+      lastWasQuote = false;
       pos = adv.pos; col = adv.col; pad = adv.pad;
       stripped = true;
     }
@@ -1092,10 +1117,10 @@ function contentAt(P, li, stack) {
   // A tab that starts exactly at the strip boundary, after containers
   // were stripped, expands to spaces (its width at that column): e.g. a
   // tab at column 13 becomes 3 spaces. A tab with no container stripped
-  // (top level) stays a tab. Inner blockquote markers do not count
-  // toward the expansion column (see quoteDepth above).
+  // (top level) stays a tab. For a blockquote innermost, only the
+  // innermost '>' marker's width counts toward the expansion column.
   if (stripped && line[pos] === '\t') {
-    const effCol = quoteDepth > 1 ? col - 2 * (quoteDepth - 1) : col;
+    const effCol = lastWasQuote ? lastDelta : col;
     const w = 4 - (effCol % 4);
     return { content: (pad > 0 ? ' '.repeat(pad) : '') + ' '.repeat(w) + line.slice(pos + 1), col: col + w };
   }
@@ -2057,6 +2082,25 @@ function parseInlineNodes(text, refs) {
       while (i + run < n && text[i + run] === '`') run++;
       const close = findCodeEnd(text, i + run, run);
       if (close < 0) {
+        addText(text.slice(i, i + run));
+        i += run;
+        continue;
+      }
+      // A code span must not swallow the `]` that closes an open link
+      // label: `[docs each ``url`]` has an unmatched `` `` `` (closing
+      // run is a single backtick), and the matching `` `` `` on a later
+      // line must not swallow the `]` — the link forms and the
+      // backticks stay literal inside it. If the strict closing run
+      // lies past the label's `]`, treat these backticks as literal.
+      let labelEnd = -1;
+      for (let j = delims.length - 1; j >= 0; j--) {
+        const dm = delims[j];
+        if (dm.active && (dm.kind === '[' || dm.kind === '![') && dm.src >= 0) {
+          labelEnd = findLabelEnd(text, dm.src + 1);
+          break;
+        }
+      }
+      if (labelEnd >= 0 && close > labelEnd) {
         addText(text.slice(i, i + run));
         i += run;
         continue;
