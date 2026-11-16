@@ -2102,8 +2102,10 @@ function parseInlineNodes(text, refs) {
       if (tagEnd > 0) {
         const tag = text.slice(i, tagEnd);
         // Raw <a>...</a> suppresses autolinks inside it (marked inLink).
+        // marked's startATag is /^<a /i: only `<a ` WITH a space (i.e.
+        // with attributes) sets it — a bare `<a>` does not (doc-04).
         const low = tag.toLowerCase();
-        if (low === '<a>' || low.startsWith('<a ') || low.startsWith('<a\t') || low.startsWith('<a\n')) inLink = true;
+        if (low.startsWith('<a ') || low.startsWith('<a\t') || low.startsWith('<a\n')) inLink = true;
         else if (low === '</a>' || low.startsWith('</a ') || low.startsWith('</a\t') || low.startsWith('</a\n') || low.startsWith('</a>')) inLink = false;
         nodes.push({ t: 'html', s: tag });
         i = tagEnd;
@@ -2150,7 +2152,14 @@ function parseInlineNodes(text, refs) {
       }
     }
     if (!inLink && isAlphaNum(c) && (i === 0 || !isEmailLocal(text[i - 1]))) {
-      const em = matchEmail(text, i);
+      // A trailing `_` is an emphasis closer (not an email char) when
+      // there is an active `_` opener that can pair with it.
+      let allowU = false;
+      for (let q = delims.length - 1; q >= 0; q--) {
+        const dm = delims[q];
+        if (dm.active && dm.kind === '_' && dm.canOpen) { allowU = true; break; }
+      }
+      const em = matchEmail(text, i, allowU);
       if (em) {
         nodes.push({ t: 'link', href: 'mailto:' + em.text, title: null, bare: true, children: [{ t: 'text', s: em.text }] });
         i = em.end;
@@ -2196,7 +2205,14 @@ function parseInlineNodes(text, refs) {
       const prev = j > 0 ? text[j - 1] : '';
       if (!inLink && (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F' || ch === 'w' || ch === 'W' || ch === 'm' || ch === 'M' || ch === 'x' || ch === 'X') && !isAlphaNum(prev) &&
           matchBareAutolink(text, j)) break;
-      if (!inLink && isAlphaNum(ch) && !isEmailLocal(prev) && matchEmail(text, j)) break;
+      if (!inLink && isAlphaNum(ch) && !isEmailLocal(prev)) {
+        let allowU = false;
+        for (let q = delims.length - 1; q >= 0; q--) {
+          const dm = delims[q];
+          if (dm.active && dm.kind === '_' && dm.canOpen) { allowU = true; break; }
+        }
+        if (matchEmail(text, j, allowU)) break;
+      }
       j++;
     }
     // Two trailing spaces before a newline are a hard break: handled by
@@ -2309,7 +2325,7 @@ function matchBareAutolink(text, i) {
 
 // Email autolink starting at text[i] (a word character). Returns
 // {end, text} or null.
-function matchEmail(text, i) {
+function matchEmail(text, i, allowTrailingUnderscore) {
   const n = text.length;
   // Fast reject: an email needs an `@` within the current word (before
   // the next space or special char). Scanning for `@` first avoids the
@@ -2345,8 +2361,12 @@ function matchEmail(text, i) {
   if (dom[0] === '.' || dom[0] === '-' || dom[dom.length - 1] === '.' || dom[dom.length - 1] === '-') return null;
   // The char after the domain must not be a word char or `-` (gfm-632
   // `a.b-c_d@a.b_` is not an email: the `_` continues the identifier).
+  // But a trailing `_` that is an emphasis closer (there is an active
+  // `_` opener that can pair with it, doc-04 `__.. because@mark..__`)
+  // does not continue the email — the email is linkified inside the em.
   const after = text[ds + dom.length];
-  if (after !== undefined && (isAlphaNum(after) || after === '_' || after === '-')) return null;
+  if (after !== undefined && (isAlphaNum(after) || after === '-')) return null;
+  if (after === '_' && !allowTrailingUnderscore) return null;
   return { end: ds + dom.length, text: local + '@' + dom };
 }
 function canInterruptPara(marker, empty) {
