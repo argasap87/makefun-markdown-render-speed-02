@@ -1826,7 +1826,24 @@ function parseInlineNodes(text, refs) {
           o = j;
           break;
         }
-        if (o < 0 && sameLengthOnly && fallback >= 0) o = fallback;
+        if (o < 0 && sameLengthOnly && fallback >= 0) {
+          // Do not split a longer opener when a later closer of the
+          // opener's own length exists — that closer needs the whole
+          // opener (`**a *b*c* d**`: the `*` after `c` must not split
+          // the `**` opener, the final `**` closes the strong). The
+          // fallback is only for openers no later closer can use whole
+          // (cm-408/413/426/430).
+          const fbOpener = delims[fallback];
+          let laterWhole = false;
+          for (let j = d + 1; j < delims.length; j++) {
+            const cl = delims[j];
+            if (!cl.active || cl.isBlocker || cl.blockedForever || cl.kind !== closer.kind ||
+                !cl.canClose || cl.len < fbOpener.len) continue;
+            laterWhole = true;
+            break;
+          }
+          if (!laterWhole) o = fallback;
+        }
         if (o < 0) break;
         // A blocker only permanently blocks when it prevented a real match:
         // the opener found lies before the blocker. A fallback opener after
