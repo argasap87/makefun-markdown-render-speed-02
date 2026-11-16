@@ -1268,7 +1268,17 @@ function parseBlocks(src, refs) {
     // line starts a NEW blockquote). Lists survive blank lines.
     if (isBlankFrom(line, 0)) {
       closePara();
-      while (stack.length > 1 && stack[stack.length - 1].t === 'quote') stack.pop();
+      // A bare blank line closes every open blockquote, and everything
+      // nested inside it — including a list inside the quote (doc-29:
+      // `> 1. one` / blank / `> three` is two blockquotes, not one).
+      // A list OUTSIDE any quote survives (it is below the quote in
+      // the stack, or there is no quote at all). So truncate the stack
+      // to just below the outermost quote, instead of popping only
+      // quotes at the stack top (a list/item between the quote and the
+      // top used to block the pop).
+      let q = -1;
+      for (let s = 1; s < stack.length; s++) if (stack[s].t === 'quote') { q = s; break; }
+      if (q >= 0) closeTo(q);
       lastBlank = true;
       // A BARE blank line separates blocks at every ancestor level (it
       // ends nested containers), so it may loosen any enclosing list
