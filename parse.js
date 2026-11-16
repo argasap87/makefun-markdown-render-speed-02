@@ -130,13 +130,14 @@ function normLabel(label) {
 
 // Is the character at position i the start of a word character for the
 // purposes of flanking checks? Punctuation = ASCII punctuation or any
-// Unicode punctuation/symbol; here a cheap approximation: not a space and
-// not alphanumeric.
+// Unicode punctuation/symbol. Letters and numbers (any script, incl.
+// Cyrillic) are NOT punctuation.
 function isPunctChar(ch) {
   if (!ch) return false;
   if (isSpace(ch)) return false;
-  if (isAlphaNum(ch)) return false;
-  return true;
+  const code = ch.codePointAt(0);
+  if (code < 128) return isPunct(ch);
+  return !/\p{L}|\p{N}/u.test(ch);
 }
 function isUnicodePunct(ch) {
   if (!ch) return false;
@@ -1586,11 +1587,23 @@ function plainText(nodes) {
 
 // Is the character a flanking punctuation/space boundary for emphasis?
 // Returns [canOpen, canClose] for a delimiter run ending/starting here.
+// Unicode whitespace for emphasis flanking: ASCII space/tab/newline/CR
+// plus NBSP (U+00A0) and the other Unicode spaces. (A plain space/tab is
+// NOT enough: `* a *` with NBSPs must not form emphasis.)
+function isUniSpace(ch) {
+  if (!ch) return false;
+  if (isSpace(ch)) return true;
+  const code = ch.codePointAt(0);
+  return code === 0x00A0 || code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200A) || code === 0x202F ||
+    code === 0x205F || code === 0x3000 || code === 0xFEFF;
+}
+
 function flanking(text, before, after) {
   const b = before;
   const a = after;
-  const bSpace = b === '' || isSpace(b);
-  const aSpace = a === '' || isSpace(a);
+  const bSpace = b === '' || isUniSpace(b);
+  const aSpace = a === '' || isUniSpace(a);
   const bPunct = !bSpace && isPunctChar(b);
   const aPunct = !aSpace && isPunctChar(a);
   const leftFlanking = !aSpace && (!aPunct || bSpace || bPunct);
@@ -1610,18 +1623,28 @@ function parseInlineNodes(text, refs) {
   function pushDelim(kind, len, canOpen, canClose, node) {
     delims.push({ kind, len, canOpen, canClose, node, active: true });
   }
-  // Resolve emphasis for the delimiters currently on the stack.
+  // Resolve emphasis for the delimiters currently on the stack, in two
+  // passes. Pass 1 pairs only same-length openers/closers (so `**` pairs
+  // with `**` for strong and `*` with `*` for em); this keeps the inner
+  // `**...**` in `*foo**bar**baz*` from being grabbed by the outer `*`.
+  // Pass 2 falls back to any-length pairing for the cases that need it
+  // (e.g. `***foo***`, `*foo**`).
   function processEmphasis() {
+    processEmphasisPass(true);
+    processEmphasisPass(false);
+  }
+  function processEmphasisPass(sameLengthOnly) {
     let d = 0;
     while (d < delims.length) {
       const closer = delims[d];
       if (!closer.active || closer.kind === '[' || closer.kind === '![' ||
           !closer.canClose) { d++; continue; }
-      // Find the nearest matching opener before d.
+      // Find the nearest opener before d (same length first in pass 1).
       let o = -1;
       for (let j = d - 1; j >= 0; j--) {
         const op = delims[j];
         if (!op.active || op.kind !== closer.kind || !op.canOpen) continue;
+        if (sameLengthOnly && op.len !== closer.len) continue;
         if (closer.kind === '_' &&
             ((op.canOpen && op.canClose) || (closer.canOpen && closer.canClose)) &&
             (op.len + closer.len) % 3 === 0) continue;
