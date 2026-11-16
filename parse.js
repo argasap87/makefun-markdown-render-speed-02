@@ -2711,11 +2711,15 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
         }
         if (quotesInStack > 0) {
           if (/^[ \t]*$/.test(raw)) break;
+          // Count the `>` markers the raw line actually has. The
+          // markers may sit past a list-item indent (more than 3
+          // spaces), so skip all leading whitespace before each `>`
+          // — contentAt already validated the line against the
+          // containers, so a `>` here is a marker, not code text.
           let markers = 0, p = 0;
           while (p < raw.length) {
-            let sp = 0;
-            while (p < raw.length && sp < 3 && raw[p] === ' ') { p++; sp++; }
-            if (p < raw.length && raw[p] === '>') { markers++; p++; if (raw[p] === ' ') p++; else if (raw[p] === '\t') p++; }
+            while (p < raw.length && (raw[p] === ' ' || raw[p] === '\t')) p++;
+            if (p < raw.length && raw[p] === '>') { markers++; p++; }
             else break;
           }
           if (markers < quotesInStack) break;
