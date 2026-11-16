@@ -288,6 +288,38 @@ function labelHasUnclosedSpan(label) {
   return inSpan;
 }
 
+// Strict version: a backtick run opens a span that closes ONLY at a run
+// of the SAME length (marked's code-span tokenizer is strict). A run of
+// 2+ backticks at the very end of the label is consumed (alternative 4)
+// and is not unclosed. Used by the code-span guard: `[run ``response`]`
+// has an unclosed `` `` `` (no run of length 2 follows), so the single
+// backtick after `response` is free to open a code span that swallows
+// the `]` (doc-35) — the link never forms there.
+function labelHasUnclosedSpanStrict(label) {
+  let i = 0;
+  const n = label.length;
+  let openRun = 0;
+  while (i < n) {
+    if (label[i] === '`') {
+      let k = i;
+      while (k < n && label[k] === '`') k++;
+      const run = k - i;
+      if (openRun === 0) {
+        if (k === n && run >= 2) return false;
+        openRun = run;
+      } else if (run === openRun) {
+        openRun = 0;
+      }
+      i = k;
+    } else if (label[i] === '\\' && i + 1 < n) {
+      i += 2;
+    } else {
+      i++;
+    }
+  }
+  return openRun !== 0;
+}
+
 function findLabelEnd(s, start) {
   // A label ends at the FIRST unescaped `]` (code spans aside). Nested
   // brackets do NOT extend it: `[ref[bar]]` has label `ref[bar`, so it
@@ -2319,14 +2351,23 @@ function parseInlineNodes(text, refs) {
       // (e.g. doc-12 `` `max_width` `` after a nested-link label)
       // is outside the label and forms a code span normally.
       let labelEnd = -1;
+      let labelUnclosed = false;
       for (let j = delims.length - 1; j >= 0; j--) {
         const dm = delims[j];
         if (dm.active && (dm.kind === '[' || dm.kind === '![') && dm.src >= 0) {
           labelEnd = findLabelEnd(text, dm.src + 1);
+          // The guard only applies when the link would actually form: a
+          // label with an unclosed code span (doc-35 `[run ``response`]`)
+          // never forms a link, so a code span opening inside it must
+          // not be blocked — it swallows the `]`. Strict pairing here
+          // (same-length run closes): the lenient label scan pairs
+          // `` `` `` with a single backtick, but the code-span
+          // tokenizer does not, so the `` `` `` is unclosed.
+          if (labelEnd >= 0) labelUnclosed = labelHasUnclosedSpanStrict(text.slice(dm.src + 1, labelEnd - 1));
           break;
         }
       }
-      if (labelEnd >= 0 && i < labelEnd && close > labelEnd) {
+      if (labelEnd >= 0 && !labelUnclosed && i < labelEnd && close > labelEnd) {
         addText(text.slice(i, i + run));
         i += run;
         continue;
