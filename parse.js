@@ -336,7 +336,7 @@ function trimUrl(u) {
     depth = 0;
     for (let i = 0; i < end; i++) {
       if (u[i] === '(') { if (depth === 0) cut = i; depth++; }
-      else if (u[i] === ')') depth--;
+      else if (u[i] === ')') { if (depth > 0) depth--; }
     }
     if (cut >= 0) end = cut;
   }
@@ -344,9 +344,18 @@ function trimUrl(u) {
   while (end > 0) {
     const c = u[end - 1];
     if (c === ')') {
+      // Keep a trailing ')' only when it closes an earlier '(' (depth
+      // just before it is > 0). A ')' at depth 0 (no open paren) does
+      // not make a LATER trailing ')' unmatched: in
+      // `https://a.com)](https://b.com)` the final ')' closes the '('
+      // before b.com and is kept, even though the ')' after a.com is
+      // unmatched.
       let d = 0;
-      for (let i = 0; i < end; i++) { if (u[i] === '(') d++; else if (u[i] === ')') d--; }
-      if (d < 0) { end--; continue; }
+      for (let i = 0; i < end - 1; i++) {
+        if (u[i] === '(') d++;
+        else if (u[i] === ')') { if (d > 0) d--; }
+      }
+      if (d <= 0) { end--; continue; }
       break;
     }
     if (PUNCT.indexOf(c) >= 0) { end--; continue; }
@@ -2226,7 +2235,29 @@ function parseInlineNodes(text, refs) {
     // Bare autolinks (scheme / www) and emails, at a word boundary.
     // Suppressed inside a raw <a>...</a> (inLink).
     if (!inLink && (c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'w' || c === 'W' || c === 'm' || c === 'M' || c === 'x' || c === 'X') && (i === 0 || !isAlphaNum(text[i - 1]))) {
-      const auto = matchBareAutolink(text, i);
+      // A bare URL stops at `]` only when it is inside a link label
+      // whose link can still form. If the open label already contains
+      // a link node, the link cannot form (a link's text cannot contain
+      // a link), so the `]` is free for the URL: doc-08
+      // `(https://a.com)](https://b.com)` is one autolink, not two.
+      let inLabel = false;
+      for (let q = delims.length - 1; q >= 0; q--) {
+        const dm = delims[q];
+        if (dm.active && (dm.kind === '[' || dm.kind === '![')) {
+          const opIdx = nodes.indexOf(dm.node);
+          let hasLink = false;
+          if (opIdx >= 0) {
+            for (let k = opIdx + 1; k < nodes.length; k++) {
+              const nd = nodes[k];
+              if (nd.t === 'link' && !nd.bare && !nd.angle) { hasLink = true; break; }
+              if (nd.children && containsLink(nd.children)) { hasLink = true; break; }
+            }
+          }
+          if (!hasLink) inLabel = true;
+          break;
+        }
+      }
+      const auto = matchBareAutolink(text, i, inLabel);
       if (auto) {
         nodes.push({ t: 'link', href: auto.href, title: null, bare: true, children: [{ t: 'text', s: auto.text }] });
         i = auto.end;
@@ -2350,8 +2381,12 @@ function isEmailLocal(ch) {
 
 // Bare autolink (scheme:// or www.) starting at text[i]. The preceding
 // character must not be alphanumeric (word boundary). Returns
-// {end, href, text} or null.
-function matchBareAutolink(text, i) {
+// {end, href, text} or null. `inLabel` is true when the URL starts
+// inside a link label: only then does a `]` end the URL (so it does not
+// swallow the label's closing bracket); outside a label, marked's URL
+// regex `[^\s<]*` keeps `]` (and a following `(...)`) in the URL
+// (doc-08 `(https://a.com)](https://b.com)` is one autolink).
+function matchBareAutolink(text, i, inLabel) {
   if (i > 0 && isAlphaNum(text[i - 1])) return null;
   let scheme = null;
   const low = text.slice(i, i + 8).toLowerCase();
@@ -2392,7 +2427,7 @@ function matchBareAutolink(text, i) {
   const n = text.length;
   while (j < n) {
     const ch = text[j];
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '<' || ch === ']') break;
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '<' || (inLabel && ch === ']')) break;
     j++;
   }
   if (j === i + scheme.length) return null;
