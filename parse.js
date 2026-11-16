@@ -1084,7 +1084,13 @@ function startsInterruptingBlock(P, i, content, ccol, stack) {
     const mi = indentOf(content, 0, ccol);
     let e = mi.idx + marker.markerLen;
     while (e < content.length && (content[e] === ' ' || content[e] === '\t')) e++;
-    if (e < content.length && canInterruptPara(marker, false)) return true;
+    const empty = e >= content.length;
+    // Inside a list, even an empty marker starts a new item (it does not
+    // become paragraph text). Outside a list, only a non-empty item that
+    // can interrupt does.
+    const inList = stack.some(b => b.t === 'item');
+    if (inList) return true;
+    if (!empty && canInterruptPara(marker, false)) return true;
   }
   if (matchQuoteMarker(content, 0, ccol, 0)) return true;
   return false;
@@ -1153,6 +1159,9 @@ function parseBlocks(src, refs) {
         if (!m) { failAt = s; break; }
         pos = m.pos; col = m.col; pad = m.pad;
       } else if (b.t === 'item') {
+        // An empty item followed by a blank line is closed: its content
+        // cannot continue after the blank (the list ends here).
+        if (b.children.length === 0 && lastBlank) { failAt = s; break; }
         const want = col + b._contentIndent;
         const ind = indentFrom(line, pos, col, pad);
         if (ind.col < want) { failAt = s; break; }
@@ -1221,9 +1230,15 @@ function parseBlocks(src, refs) {
       // Blank content with no paragraph open (e.g. a bare `>` line) is a
       // blank line: it must NOT start an empty paragraph. (When a
       // paragraph IS open, the line is a continuation and is added below.)
+      // An empty list item's content is also blank, but it is NOT a blank
+      // line: do not set lastBlank for it (it would wrongly loosen the
+      // list when the next item is added).
       if (isBlankFrom(content, 0) && !paraOpen) {
-        closePara();
-        lastBlank = true;
+        const top = stack[stack.length - 1];
+        if (!(top && top.t === 'item' && top.children.length === 0)) {
+          closePara();
+          lastBlank = true;
+        }
         i++;
         break;
       }
@@ -1300,7 +1315,10 @@ function parseBlocks(src, refs) {
         let e = mi.idx + marker.markerLen;
         while (e < content.length && (content[e] === ' ' || content[e] === '\t')) e++;
         const empty = e >= content.length;
-        if (!paraOpen || canInterruptPara(marker, empty)) {
+        // Inside a list, a marker (even an empty one) starts a new item.
+        // Outside, only a non-empty item that can interrupt does.
+        const inList = stack.some(b => b.t === 'item');
+        if (!paraOpen || inList || canInterruptPara(marker, empty)) {
           closePara();
           const res = startListItem(P, i, stack, marker, content, ccol, lastBlank);
           if (res) {
@@ -2116,15 +2134,19 @@ function startListItem(P, i, stack, marker, content, ccol, lastBlank) {
     }
   }
   // Find or create the list: the current container's last child, if it is a
-  // list of the same kind at the same indent, continues.
+  // list of the same kind, continues when the new marker is a sibling of
+  // the last item — i.e. its indent is below the last item's content
+  // indent (so `- foo`, ` - bar`, `  - baz` are one list). At or above
+  // that indent it is a sublist (a new list nested in the item).
   const parent = blockParent(stack);
   const kids = parent.children;
   let list = null;
   if (kids.length > 0) {
     const last = kids[kids.length - 1];
-    if (last.t === 'list' && last._markerIndent === mcol &&
-        last.ordered === marker.ordered && last._delim === marker.delim) {
-      list = last;
+    if (last.t === 'list' && last.ordered === marker.ordered &&
+        last._delim === marker.delim && last.items.length > 0) {
+      const lastItem = last.items[last.items.length - 1];
+      if (mcol - ccol < lastItem._contentIndent) list = last;
     }
   }
   if (!list) {
