@@ -289,7 +289,16 @@ function findLabelEnd(s, start) {
         if (s[j] === '\\' && j + 1 < n) { j += 2; continue; }
         j++;
       }
-      if (close < 0) { i = k; continue; }
+      if (close < 0) {
+        // No closing backtick run. Marked's label regex has one more
+        // alternative: `` ``+(?=\]) `` — a run of 2+ backticks immediately
+        // before `]` is consumed as a unit and the `]` ends the label
+        // (doc-16 `[at `` a ` b ``]` forms a link). Otherwise the span is
+        // unclosed and swallows the rest, so no `]` ends the label and
+        // the link does not form (`[at `` a ` b ``_]` does not).
+        if (k - i >= 2 && s[k] === ']') return k + 1;
+        return -1;
+      }
       i = close; continue;
     }
     if (c === '\\' && i + 1 < n) { i += 2; continue; }
