@@ -1053,6 +1053,10 @@ function listMarker(line, pos, col) {
 
 export function parse(markdown) {
   const refs = new Map();
+  // marked's inLink persists across paragraphs within one parse: an
+  // unclosed raw `<a>` suppresses bare autolinks/emails later in the
+  // document (doc-03 `<a href="foo\\\nbar">` kills a later email link).
+  inLink = false;
   return renderBlocks(parseBlocks(markdown, refs), refs);
 }
 
@@ -1683,13 +1687,13 @@ function flanking(text, before, after) {
 // Parse inline markdown into a node list. Single left-to-right scan with a
 // delimiter stack for emphasis and links (CommonMark 0.31.2 algorithm).
 const INLINE_SPECIAL_RE = /[\\`*_~[\]<&\n]|!(?=\[)/g;
+// Raw `<a>` state, shared across inline runs within one parse() (see parse).
+let inLink = false;
 function parseInlineNodes(text, refs) {
   const nodes = [];
   const delims = [];
   const n = text.length;
   let i = 0;
-  // Inside a raw <a>...</a>: bare autolinks and emails are suppressed.
-  let inLink = false;
 
   function addText(s) { if (s) nodes.push({ t: 'text', s }); }
   function pushDelim(kind, len, canOpen, canClose, node, src) {
@@ -1729,42 +1733,38 @@ function parseInlineNodes(text, refs) {
       }
       if (o < 0) { d += step; continue; }
       const opener = delims[o];
-      // Earlier-closer priority (pass 1 only): if an earlier closer C'
-      // (same kind, still active) has this opener as its nearest opener
-      // (any length), C' gets it first — a later closer must not steal
-      // an opener an earlier longer closer needs (doc-01 `**with *this
-      // be***` + `*so*version*?`: the `*` before `?` must not take the
-      // `*` opener the `***` closer needs).
       // Earlier-closer priority (both passes): if an earlier PURE closer
-      // C' (same kind, still active, canClose but not canOpen) that is
-      // LONGER than this closer has this opener as its nearest opener
-      // (any length), C' gets it first — a later shorter closer must not
-      // steal an opener an earlier longer closer needs (doc-01 `**with
-      // *this be***` + `*so*version*?`: the `*` before `?` must not take
-      // the `*` opener the `***` closer needs). The longer-than rule
-      // keeps a same-length pairing from being blocked by a shorter
-      // dangling closer (`**a *b*c* d**`: the `*` after `c` must not
-      // reserve the `**` opener from the `**` closer). A middle
-      // delimiter that can also open (cm-412 `*foo**bar*`) does not
-      // reserve the opener.
+      // C' (same kind, still active, canClose but not canOpen) would
+      // consume this opener — scanning backward from C' and accumulating
+      // opener lengths up to C'.len (a long closer splits across several
+      // openers) — C' gets it first. A later closer must not steal an
+      // opener an earlier closer needs (doc-01 `**with *this be***` +
+      // `*so*version*?`; doc-02 `*uses will **issue lines*** ... 2*3*4`:
+      // the `*` in `2*3` must not take the `*` opener the `***` closer
+      // needs after splitting). C' reserves O when it matches O's length
+      // or is longer than this closer; a shorter dangling closer must
+      // not reserve a longer opener from its same-length closer (`**a
+      // *b*c* d**`). A middle delimiter that can also open (cm-412
+      // `*foo**bar*`) does not reserve.
       {
         let stolen = false;
         for (let c2 = 0; c2 < d; c2++) {
           const cl2 = delims[c2];
           if (!cl2.active || cl2.kind !== closer.kind || !cl2.canClose || cl2.canOpen) continue;
-          if (cl2.len <= closer.len) continue;
-          // Nearest opener for cl2 (any length).
-          let o2 = -1;
-          for (let j = c2 - 1; j >= 0; j--) {
+          if (cl2.len !== opener.len && cl2.len <= closer.len) continue;
+          // Openers C' would consume (nearest first, up to C'.len).
+          let need = cl2.len;
+          let reserves = false;
+          for (let j = c2 - 1; j >= 0 && need > 0; j--) {
             const op2 = delims[j];
             if (!op2.active || op2.kind !== cl2.kind || !op2.canOpen) continue;
             if (cl2.kind === '_' &&
                 ((op2.canOpen && op2.canClose) || (cl2.canOpen && cl2.canClose)) &&
                 (op2.len + cl2.len) % 3 === 0) continue;
-            o2 = j;
-            break;
+            if (j === o) { reserves = true; break; }
+            need -= Math.min(op2.len, need);
           }
-          if (o2 === o) { stolen = true; break; }
+          if (reserves) { stolen = true; break; }
         }
         if (stolen) { d += step; continue; }
       }
@@ -1776,6 +1776,24 @@ function parseInlineNodes(text, refs) {
       const clIdx = nodes.indexOf(clNode);
       if (opIdx < 0 || clIdx < 0 || clIdx <= opIdx) { d += step; continue; }
       const children = nodes.slice(opIdx + 1, clIdx);
+      // Resolve emphasis INSIDE the em first (doc-02 `**create same
+      // _examples __files guide___**`: the inner `_`/`__`/`___` must
+      // pair before the outer `**` closes over them). Collect the inner
+      // delimiters, resolve them in the children range, then build the
+      // outer node from the resolved children.
+      const childSet = new Set(children);
+      const innerDelims = [];
+      for (let j = delims.length - 1; j >= 0; j--) {
+        const dm = delims[j];
+        if (dm === opener || dm === closer) continue;
+        if (dm.active && childSet.has(dm.node)) {
+          innerDelims.unshift(dm);
+          delims.splice(j, 1);
+          if (j < d) d--;
+          if (j < o) o--;
+        }
+      }
+      if (innerDelims.length > 0) processEmphasisRange(children, innerDelims);
       // Consume `use` chars: opener takes from the end of its run, closer
       // from the start of its run.
       opener.len -= use;
@@ -1789,19 +1807,6 @@ function parseInlineNodes(text, refs) {
       replacement.push(emNode);
       if (clNode.s) replacement.push(clNode);
       nodes.splice(opIdx, clIdx - opIdx + 1, ...replacement);
-      // Delimiters whose nodes were inside the em are now closed: remove
-      // them from the stack (they cannot pair across the em boundary).
-      // A Set makes the membership test O(1) instead of O(children).
-      const childSet = new Set(children);
-      for (let j = delims.length - 1; j >= 0; j--) {
-        const dm = delims[j];
-        if (dm === opener || dm === closer) continue;
-        if (dm.active && childSet.has(dm.node)) {
-          delims.splice(j, 1);
-          if (j < d) d--;
-          if (j < o) o--;
-        }
-      }
       if (opener.len === 0) { delims.splice(o, 1); if (o < d) d--; }
       if (closer.len === 0) {
         const ci = delims.indexOf(closer);
@@ -1957,10 +1962,12 @@ function parseInlineNodes(text, refs) {
     }
   }
 
-  // Does any node in the list (recursively) contain a link?
+  // Does any node in the list (recursively) contain an explicit link?
+  // Bare and angle autolinks do not count: bare ones are flattened to
+  // text, angle ones may nest inside a link's text.
   function containsLink(list) {
     for (const nd of list) {
-      if (nd.t === 'link') return true;
+      if (nd.t === 'link' && !nd.bare && !nd.angle) return true;
       if (nd.children && containsLink(nd.children)) return true;
     }
     return false;
@@ -2084,7 +2091,10 @@ function parseInlineNodes(text, refs) {
     if (c === '<') {
       const auto = matchAngleAutolink(text, i);
       if (auto) {
-        nodes.push({ t: 'link', href: auto.href, title: null, children: [{ t: 'text', s: auto.text }] });
+        // Angle autolinks may nest inside a link's text (doc-03
+        // `[.. <https://..> ..](..)` keeps the inner link); they are
+        // not flattened and do not block the outer link.
+        nodes.push({ t: 'link', href: auto.href, title: null, angle: true, children: [{ t: 'text', s: auto.text }] });
         i = auto.end;
         continue;
       }
@@ -2284,7 +2294,7 @@ function matchBareAutolink(text, i) {
   const n = text.length;
   while (j < n) {
     const ch = text[j];
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '<') break;
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '<' || ch === ']') break;
     j++;
   }
   if (j === i + scheme.length) return null;
