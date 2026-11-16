@@ -447,10 +447,7 @@ function scanHtmlTag(s, i) {
       if (s[j] === '"' || s[j] === "'") {
         const q = s[j];
         j++;
-        while (j < n && s[j] !== q) {
-          if (s[j] === '\n') return -1;
-          j++;
-        }
+        while (j < n && s[j] !== q) j++;
         if (j >= n) return -1;
         j++;
       } else {
@@ -1632,6 +1629,8 @@ function parseInlineNodes(text, refs) {
   const delims = [];
   const n = text.length;
   let i = 0;
+  // Inside a raw <a>...</a>: bare autolinks and emails are suppressed.
+  let inLink = false;
 
   function addText(s) { if (s) nodes.push({ t: 'text', s }); }
   function pushDelim(kind, len, canOpen, canClose, node) {
@@ -1960,7 +1959,12 @@ function parseInlineNodes(text, refs) {
       }
       const tagEnd = scanHtmlTag(text, i);
       if (tagEnd > 0) {
-        nodes.push({ t: 'html', s: text.slice(i, tagEnd) });
+        const tag = text.slice(i, tagEnd);
+        // Raw <a>...</a> suppresses autolinks inside it (marked inLink).
+        const low = tag.toLowerCase();
+        if (low === '<a>' || low.startsWith('<a ') || low.startsWith('<a\t') || low.startsWith('<a\n')) inLink = true;
+        else if (low === '</a>' || low.startsWith('</a ') || low.startsWith('</a\t') || low.startsWith('</a\n') || low.startsWith('</a>')) inLink = false;
+        nodes.push({ t: 'html', s: tag });
         i = tagEnd;
         continue;
       }
@@ -1995,7 +1999,8 @@ function parseInlineNodes(text, refs) {
       continue;
     }
     // Bare autolinks (scheme / www) and emails, at a word boundary.
-    if ((c === 'h' || c === 'f' || c === 'w') && (i === 0 || !isAlphaNum(text[i - 1]))) {
+    // Suppressed inside a raw <a>...</a> (inLink).
+    if (!inLink && (c === 'h' || c === 'f' || c === 'w') && (i === 0 || !isAlphaNum(text[i - 1]))) {
       const auto = matchBareAutolink(text, i);
       if (auto) {
         nodes.push({ t: 'link', href: auto.href, title: null, children: [{ t: 'text', s: auto.text }] });
@@ -2003,7 +2008,7 @@ function parseInlineNodes(text, refs) {
         continue;
       }
     }
-    if (isAlphaNum(c) && (i === 0 || !isEmailLocal(text[i - 1]))) {
+    if (!inLink && isAlphaNum(c) && (i === 0 || !isEmailLocal(text[i - 1]))) {
       const em = matchEmail(text, i);
       if (em) {
         nodes.push({ t: 'link', href: 'mailto:' + em.text, title: null, children: [{ t: 'text', s: em.text }] });
@@ -2021,9 +2026,9 @@ function parseInlineNodes(text, refs) {
           ch === '[' || ch === ']' || ch === '<' || ch === '&' || ch === '\n' ||
           (ch === '!' && text[j + 1] === '[')) break;
       const prev = j > 0 ? text[j - 1] : '';
-      if ((ch === 'h' || ch === 'f' || ch === 'w') && !isAlphaNum(prev) &&
+      if (!inLink && (ch === 'h' || ch === 'f' || ch === 'w') && !isAlphaNum(prev) &&
           matchBareAutolink(text, j)) break;
-      if (isAlphaNum(ch) && !isEmailLocal(prev) && matchEmail(text, j)) break;
+      if (!inLink && isAlphaNum(ch) && !isEmailLocal(prev) && matchEmail(text, j)) break;
       j++;
     }
     // Two trailing spaces before a newline are a hard break: handled by
@@ -2357,6 +2362,9 @@ function parseTable(P, i, stack, hdr, del, content, ccol, lastBlank) {
   while (k < n) {
     const c = contentAt(P, k, stack);
     if (!c || isBlankFrom(c.content, 0)) break;
+    // A line that starts a block (blockquote, heading, fence, ...) ends
+    // the table; a bare line without `|` is still a one-cell row.
+    if (startsInterruptingBlock(P, k, c.content, c.col, stack)) break;
     const cells = splitTableRow(c.content);
     while (cells.length < hdr.length) cells.push('');
     if (cells.length > hdr.length) cells.length = hdr.length;
