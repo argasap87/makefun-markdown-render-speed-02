@@ -1116,7 +1116,13 @@ function matchQuoteMarker(line, pos, col, pad) {
   j++; c++;
   if (line[j] === ' ') { j++; c++; }
   else if (line[j] === '\t') {
-    const w = 4 - (c % 4);
+    // A tab directly after '>' expands by the marker's OWN width
+    // (leading spaces before '>' plus the '>'), not the absolute
+    // column — the marker resets the column for the tab (doc-30:
+    // a '>' inside a list item followed by a tab expands to 2
+    // spaces of content indent, not 0). The tab's first column is
+    // the marker's trailing space, so the pad is w - 1.
+    const w = 4 - ((c - col) % 4);
     j++;
     if (w > 1) { p = w - 1; c += 1; }
     else c += w;
@@ -2799,13 +2805,17 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
       // A leading tab in the dedented content expands to spaces when the
       // fence is inside a container (doc-22: `>   \tindented` in a
       // ```rust fence becomes 4 spaces; at top level the tab is kept).
-      if (stack.length > 1 && line.length > 0 && (line[0] === '\t' || line[0] === ' ')) {
-        let out = '', col = 0, j = 0;
+      // The tab's width comes from its ABSOLUTE column in the source
+      // (the dedented content starts at c.col + fenceIndent), not from
+      // column 0 of the dedented line (doc-30: a tab at absolute column
+      // 3 expands to 1 space, not 4).
+      if (stack.length > 1 && line.length > 0 && line.slice(0, line.search(/[^ \t]/) < 0 ? line.length : line.search(/[^ \t]/)).includes('\t')) {
+        let out = '', col = c.col + fenceIndent, j = 0;
         while (j < line.length && (line[j] === ' ' || line[j] === '\t')) {
           if (line[j] === ' ') { out += ' '; col++; j++; }
           else { const w = 4 - (col % 4); out += ' '.repeat(w); col += w; j++; }
         }
-        if (j > 0 && line.slice(0, j).includes('\t')) line = out + line.slice(j);
+        line = out + line.slice(j);
       }
       lines.push(line);
       k++;
