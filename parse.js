@@ -1698,7 +1698,7 @@ function parseInlineNodes(text, refs) {
     const done = () => reverse ? d < 0 : d >= delims.length;
     while (!done()) {
       const closer = delims[d];
-      if (!closer.active || closer.kind === '[' || closer.kind === '![' ||
+      if (!closer.active || closer.isBlocker || closer.blockedForever || closer.kind === '[' || closer.kind === '![' ||
           !closer.canClose) { d += step; continue; }
       // Find the nearest opener before d (same length first in pass 1).
       // Pass 1 fallback: if no same-length opener exists, a PURE closer
@@ -1709,9 +1709,21 @@ function parseInlineNodes(text, refs) {
       // (cm-429 `**foo*bar*baz**`: the `*` after `foo` opens `<em>bar</em>`).
       let o = -1;
       let fallback = -1;
+      let blocked = false;
       for (let j = d - 1; j >= 0; j--) {
         const op = delims[j];
         if (!op.active || op.kind !== closer.kind || !op.canOpen) continue;
+        // A BLOCKER (an open-capable closer left behind by an inner
+        // strong/em) stops the search when the rule of 3 applies: the
+        // closer cannot reach an opener before the blocker (`*a **b**c*`,
+        // doc-03/doc-07). A blocker is single-use: the first closer that
+        // encounters it deactivates it, so a LATER closer (e.g. the final
+        // `*` in `*a **b**c*d*e*`) can still match the outer opener.
+        if (op.isBlocker) {
+          op.active = false;
+          if ((op.len + closer.len) % 3 === 0) { blocked = true; break; }
+          continue;
+        }
         if (sameLengthOnly && op.len !== closer.len) {
           if (fallback < 0 && !closer.canOpen && op.len > closer.len) fallback = j;
           continue;
@@ -1723,7 +1735,8 @@ function parseInlineNodes(text, refs) {
         break;
       }
       if (o < 0 && sameLengthOnly && fallback >= 0) o = fallback;
-      if (o < 0) { d += step; continue; }
+      if (blocked) closer.blockedForever = true;
+      if (blocked || o < 0) { d += step; continue; }
       const opener = delims[o];
       // Earlier-closer priority (both passes): if an earlier PURE closer
       // C' (same kind, still active, canClose but not canOpen) would
@@ -1788,6 +1801,8 @@ function parseInlineNodes(text, refs) {
       if (innerDelims.length > 0) processEmphasisRange(children, innerDelims);
       // Consume `use` chars: opener takes from the end of its run, closer
       // from the start of its run.
+      const origCloserLen = closer.len;
+      const closerCouldOpen = closer.canOpen;
       opener.len -= use;
       closer.len -= use;
       opNode.s = opNode.s.slice(0, opNode.s.length - use);
@@ -1802,7 +1817,22 @@ function parseInlineNodes(text, refs) {
       if (opener.len === 0) { delims.splice(o, 1); if (o < d) d--; }
       if (closer.len === 0) {
         const ci = delims.indexOf(closer);
-        if (ci >= 0) { delims.splice(ci, 1); if (ci < d) d--; }
+        if (ci >= 0) {
+          // A blocker is left behind only when the closer can open AND
+          // the opener it paired with is a PURE opener (cannot close).
+          // If the opener can also close, the pairing is balanced and no
+          // blocker forms (`**foo*bar*baz**` forms the outer strong, but
+          // `**a *b*c**` does not — there the inner opener `*` before `b`
+          // is pure). A blocker stops the next closer from reaching an
+          // opener before the inner emphasis (`*a **b**c*`, doc-03/doc-07).
+          if (closerCouldOpen && !opener.canClose) {
+            closer.len = origCloserLen;
+            closer.isBlocker = true;
+            closer.canClose = false;
+          } else {
+            delims.splice(ci, 1); if (ci < d) d--;
+          }
+        }
         // Forward scan: the next delimiter shifted into index d, so stay
         // (it is examined next). Reverse scan: index d now holds an
         // already-processed delimiter, so step left.
