@@ -1224,7 +1224,18 @@ function parseBlocks(src, refs) {
     for (let s = 1; s < stack.length; s++) {
       const b = stack[s];
       if (b.t === 'para') break;
-      if (isBlankFrom(line, pos)) break; // blank after markers: blank line
+      // Blank after the matched markers: a line with NO further content
+      // still closes any remaining BLOCKQUOTE (it lacks that quote's
+      // marker — `>` ends an inner `> > ` quote, and a later `> > ` line
+      // starts a NEW one). Lists survive blank lines, so only quotes
+      // force a failure here.
+      if (isBlankFrom(line, pos)) {
+        for (let t = s; t < stack.length; t++) {
+          if (stack[t].t === 'para') break;
+          if (stack[t].t === 'quote') { failAt = t; break; }
+        }
+        break;
+      }
       if (b.t === 'quote') {
         const m = matchQuoteMarker(line, pos, col, pad);
         if (!m) { failAt = s; break; }
@@ -1244,9 +1255,12 @@ function parseBlocks(src, refs) {
       // A container did not match. If a paragraph is open and the line does
       // NOT start a block that can interrupt a paragraph, it is a lazy
       // continuation line of that paragraph; otherwise close the containers
-      // and let phase 2 start the new block.
+      // and let phase 2 start the new block. A line that is blank after
+      // the matched markers (e.g. `>` with no inner `> > `) is NOT a
+      // lazy continuation — it closes the unmatched container.
       const lazyContent0 = (pad > 0 ? ' '.repeat(pad) : '') + line.slice(pos);
       if (stack.length > 0 && stack[stack.length - 1].t === 'para' &&
+          lazyContent0.trim() !== '' &&
           !startsInterruptingBlock(P, i, lazyContent0, col, stack)) {
         // A lazy continuation line indented 4+ columns loses 4 columns of
         // leading whitespace (the indented-code indent); a less-indented
