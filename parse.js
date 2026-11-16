@@ -1763,59 +1763,67 @@ function parseInlineNodes(text, refs) {
       // grabs the opener (cm-408/413/426/430). A closer that can also open
       // must NOT split: it serves as an opener for a later closer
       // (cm-429 `**foo*bar*baz**`: the `*` after `foo` opens `<em>bar</em>`).
+      // If the nearest opener is reserved by an earlier PURE closer (see
+      // the stolen check below), keep scanning backward for the next
+      // opener — the closer may pair with an earlier one instead
+      // (`*a *b **c*** d*`: the final `*` pairs with the outer `*a`
+      // after the `***` closer reserves the inner `*b`).
       let o = -1;
-      let fallback = -1;
       let hitBlocker = false;
       let blockerIdx = -1;
-      for (let j = d - 1; j >= 0; j--) {
-        const op = delims[j];
-        if (!op.active || op.kind !== closer.kind || !op.canOpen) continue;
-        // A BLOCKER (an open-capable closer left behind by an inner
-        // strong/em) bars the closer from an opener before it when the
-        // rule of 3 applies (`*a **b**c*`, doc-03/doc-07). It is
-        // single-use (deactivated on encounter). It only permanently
-        // blocks when it actually prevents a match: an opener found past
-        // it (before it) is barred, but an opener after it — including a
-        // pass-1 fallback opener nearer the closer — is not (doc-03
-        // `*using *type guide in**`: the `**` closer has no same-length
-        // opener in pass 1, so it must retry in pass 2).
-        if (op.isBlocker) {
-          op.active = false;
-          if ((op.len + closer.len) % 3 === 0) { hitBlocker = true; blockerIdx = j; }
-          continue;
+      let searchFrom = d - 1;
+      for (;;) {
+        let fallback = -1;
+        hitBlocker = false;
+        blockerIdx = -1;
+        for (let j = searchFrom; j >= 0; j--) {
+          const op = delims[j];
+          if (!op.active || op.kind !== closer.kind || !op.canOpen) continue;
+          // A BLOCKER (an open-capable closer left behind by an inner
+          // strong/em) bars the closer from an opener before it when the
+          // rule of 3 applies (`*a **b**c*`, doc-03/doc-07). It is
+          // single-use (deactivated on encounter). It only permanently
+          // blocks when it actually prevents a match: an opener found past
+          // it (before it) is barred, but an opener after it — including a
+          // pass-1 fallback opener nearer the closer — is not (doc-03
+          // `*using *type guide in**`: the `**` closer has no same-length
+          // opener in pass 1, so it must retry in pass 2).
+          if (op.isBlocker) {
+            op.active = false;
+            if ((op.len + closer.len) % 3 === 0) { hitBlocker = true; blockerIdx = j; }
+            continue;
+          }
+          if (sameLengthOnly && op.len !== closer.len) {
+            if (fallback < 0 && !closer.canOpen && op.len > closer.len) fallback = j;
+            continue;
+          }
+          if (closer.kind === '_' &&
+              ((op.canOpen && op.canClose) || (closer.canOpen && closer.canClose)) &&
+              (op.len + closer.len) % 3 === 0) continue;
+          o = j;
+          break;
         }
-        if (sameLengthOnly && op.len !== closer.len) {
-          if (fallback < 0 && !closer.canOpen && op.len > closer.len) fallback = j;
-          continue;
-        }
-        if (closer.kind === '_' &&
-            ((op.canOpen && op.canClose) || (closer.canOpen && closer.canClose)) &&
-            (op.len + closer.len) % 3 === 0) continue;
-        o = j;
-        break;
-      }
-      if (o < 0 && sameLengthOnly && fallback >= 0) o = fallback;
-      // A blocker only permanently blocks when it prevented a real match:
-      // the opener found lies before the blocker. A fallback opener after
-      // the blocker is unaffected.
-      const barred = hitBlocker && o >= 0 && o < blockerIdx;
-      if (barred) closer.blockedForever = true;
-      if (barred || o < 0) { d += step; continue; }
-      const opener = delims[o];
-      // Earlier-closer priority (both passes): if an earlier PURE closer
-      // C' (same kind, still active, canClose but not canOpen) would
-      // consume this opener — scanning backward from C' and accumulating
-      // opener lengths up to C'.len (a long closer splits across several
-      // openers) — C' gets it first. A later closer must not steal an
-      // opener an earlier closer needs (doc-01 `**with *this be***` +
-      // `*so*version*?`; doc-02 `*uses will **issue lines*** ... 2*3*4`:
-      // the `*` in `2*3` must not take the `*` opener the `***` closer
-      // needs after splitting). C' reserves O when it matches O's length
-      // or is longer than this closer; a shorter dangling closer must
-      // not reserve a longer opener from its same-length closer (`**a
-      // *b*c* d**`). A middle delimiter that can also open (cm-412
-      // `*foo**bar*`) does not reserve.
-      {
+        if (o < 0 && sameLengthOnly && fallback >= 0) o = fallback;
+        if (o < 0) break;
+        // A blocker only permanently blocks when it prevented a real match:
+        // the opener found lies before the blocker. A fallback opener after
+        // the blocker is unaffected.
+        const barred = hitBlocker && o >= 0 && o < blockerIdx;
+        if (barred) { closer.blockedForever = true; o = -1; break; }
+        const opener = delims[o];
+        // Earlier-closer priority (both passes): if an earlier PURE closer
+        // C' (same kind, still active, canClose but not canOpen) would
+        // consume this opener — scanning backward from C' and accumulating
+        // opener lengths up to C'.len (a long closer splits across several
+        // openers) — C' gets it first. A later closer must not steal an
+        // opener an earlier closer needs (doc-01 `**with *this be***` +
+        // `*so*version*?`; doc-02 `*uses will **issue lines*** ... 2*3*4`:
+        // the `*` in `2*3` must not take the `*` opener the `***` closer
+        // needs after splitting). C' reserves O when it matches O's length
+        // or is longer than this closer; a shorter dangling closer must
+        // not reserve a longer opener from its same-length closer (`**a
+        // *b*c* d**`). A middle delimiter that can also open (cm-412
+        // `*foo**bar*`) does not reserve.
         let stolen = false;
         for (let c2 = 0; c2 < d; c2++) {
           const cl2 = delims[c2];
@@ -1835,8 +1843,14 @@ function parseInlineNodes(text, refs) {
           }
           if (reserves) { stolen = true; break; }
         }
-        if (stolen) { d += step; continue; }
+        if (!stolen) break;
+        // This opener is reserved by an earlier closer: try the next
+        // opener further back.
+        searchFrom = o - 1;
+        o = -1;
       }
+      if (o < 0) { d += step; continue; }
+      const opener = delims[o];
       const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
       const tag = closer.kind === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
       const opNode = opener.node;
