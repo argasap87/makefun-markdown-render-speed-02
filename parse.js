@@ -585,8 +585,24 @@ function isBlankFrom(s, i) {
 // Content of line s starting at absolute column `target`. s[0] sits at
 // absolute column `startCol`. A partially-consumed tab at the boundary
 // expands to spaces.
-function contentFromCol(s, startCol, targetCol) {
+// Content of string s from absolute column targetCol (s starts at
+// startCol). Spaces advance one column; a tab advances to the next
+// multiple of 4. When `wholeTab` is set, a tab that would overshoot the
+// target is consumed ENTIRELY (no remainder spaces) — marked's fenced
+// code dedent removes up to N leading whitespace CHARACTERS, so a tab
+// counts as one unit (doc-13: a `\tindented` line in a ``` fence
+// indented 2 loses the whole tab, not 2 of its 4 columns; `\t\t` in a
+// fence indented 2 loses both tabs). Without it, the tab's overshoot
+// becomes remainder spaces (indented code blocks).
+function contentFromCol(s, startCol, targetCol, wholeTab) {
   let col = startCol, i = 0;
+  if (wholeTab) {
+    // Character-count dedent: remove up to (targetCol - startCol)
+    // leading whitespace characters (space or tab = 1 each).
+    let n = targetCol - startCol;
+    while (i < s.length && n > 0 && (s[i] === ' ' || s[i] === '\t')) { i++; n--; }
+    return s.slice(i);
+  }
   while (i < s.length && col < targetCol) {
     const c = s[i];
     if (c === ' ') { col++; i++; }
@@ -2822,7 +2838,7 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
           if (markers < quotesInStack) break;
         }
       }
-      let line = contentFromCol(c.content, c.col, c.col + fenceIndent);
+      let line = contentFromCol(c.content, c.col, c.col + fenceIndent, true);
       // A leading tab in the dedented content expands to spaces when the
       // fence is inside a container (doc-22: `>   \tindented` in a
       // ```rust fence becomes 4 spaces; at top level the tab is kept).
@@ -2886,7 +2902,7 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
     // false there).
     if (itemIndentFails && lines.length === 0) break;
     if (isFenceClose(raw, 0, 0, fence.ch, fence.len)) { k++; break; }
-    lines.push(contentFromCol(raw, 0, fenceIndent));
+    lines.push(contentFromCol(raw, 0, fenceIndent, true));
     k++;
   }
   // Drop exactly one trailing empty line (the code always ends with a
