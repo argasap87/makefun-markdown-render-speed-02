@@ -1045,6 +1045,7 @@ function matchQuoteMarker(line, pos, col, pad) {
 function contentAt(P, li, stack) {
   const line = P.lines[li];
   let pos = 0, col = 0, pad = 0;
+  let stripped = false;
   for (let s = 1; s < stack.length; s++) {
     const b = stack[s];
     if (b.t === 'para') break;
@@ -1053,6 +1054,7 @@ function contentAt(P, li, stack) {
       const m = matchQuoteMarker(line, pos, col, pad);
       if (!m) return null;
       pos = m.pos; col = m.col; pad = m.pad;
+      stripped = true;
     } else if (b.t === 'item') {
       // _contentIndent is relative to the column after the containers
       // before this item (blockquote columns shift per line).
@@ -1061,7 +1063,16 @@ function contentAt(P, li, stack) {
       if (ind.col < want) return null;
       const adv = advanceTo(line, pos, col, pad, want);
       pos = adv.pos; col = adv.col; pad = adv.pad;
+      stripped = true;
     }
+  }
+  // A tab that starts exactly at the strip boundary, after containers
+  // were stripped, expands to spaces (its width at that column): e.g. a
+  // tab at column 13 becomes 3 spaces. A tab with no container stripped
+  // (top level) stays a tab.
+  if (stripped && line[pos] === '\t') {
+    const w = 4 - (col % 4);
+    return { content: (pad > 0 ? ' '.repeat(pad) : '') + ' '.repeat(w) + line.slice(pos + 1), col: col + w };
   }
   // A blank line keeps its whitespace content (code blocks need the spaces:
   // a 6-space line in indented code is 2 spaces of content, a 2-space line
@@ -2221,9 +2232,42 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
   const fenceIndent = indentOf(content, 0, ccol).col - ccol;
   while (k < n) {
     const c = contentAt(P, k, stack);
-    if (!c) break;
-    if (isFenceClose(c.content, 0, c.col, fence.ch, fence.len)) { k++; break; }
-    lines.push(contentFromCol(c.content, c.col, c.col + fenceIndent));
+    if (c) {
+      if (isFenceClose(c.content, 0, c.col, fence.ch, fence.len)) { k++; break; }
+      lines.push(contentFromCol(c.content, c.col, c.col + fenceIndent));
+      k++;
+      continue;
+    }
+    // A line that does not match the enclosing containers still belongs
+    // to an open fenced code block when the mismatch is a LIST item
+    // (marked keeps a column-0 line inside a fence opened in a list
+    // item). A blank line, or a line that fails a BLOCKQUOTE marker,
+    // closes the blockquote (and the fence) instead.
+    const raw = P.lines[k];
+    if (isBlankFrom(raw, 0)) break;
+    let quoteFails = false;
+    {
+      let p2 = 0, c2 = 0, pd2 = 0;
+      for (let s = 1; s < stack.length; s++) {
+        const b = stack[s];
+        if (b.t === 'para') break;
+        if (isBlankFrom(raw, p2)) break;
+        if (b.t === 'quote') {
+          const m = matchQuoteMarker(raw, p2, c2, pd2);
+          if (!m) { quoteFails = true; break; }
+          p2 = m.pos; c2 = m.col; pd2 = m.pad;
+        } else if (b.t === 'item') {
+          const want = c2 + b._contentIndent;
+          const ind = indentFrom(raw, p2, c2, pd2);
+          if (ind.col < want) break;
+          const adv = advanceTo(raw, p2, c2, pd2, want);
+          p2 = adv.pos; c2 = adv.col; pd2 = adv.pad;
+        }
+      }
+    }
+    if (quoteFails) break;
+    if (isFenceClose(raw, 0, 0, fence.ch, fence.len)) { k++; break; }
+    lines.push(contentFromCol(raw, 0, fenceIndent));
     k++;
   }
   // Drop exactly one trailing empty line (the code always ends with a
