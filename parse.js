@@ -1063,6 +1063,11 @@ function contentAt(P, li, stack) {
   const line = P.lines[li];
   let pos = 0, col = 0, pad = 0;
   let stripped = false;
+  // Number of blockquote levels stripped: inner '>' markers do not
+  // contribute to the tab-expansion column (marked expands a boundary
+  // tab as if only the outermost '> ' counted, so '> > \t' is 2 spaces,
+  // not 4). Track it to compute the effective column below.
+  let quoteDepth = 0;
   for (let s = 1; s < stack.length; s++) {
     const b = stack[s];
     if (b.t === 'para') break;
@@ -1072,6 +1077,7 @@ function contentAt(P, li, stack) {
       if (!m) return null;
       pos = m.pos; col = m.col; pad = m.pad;
       stripped = true;
+      quoteDepth++;
     } else if (b.t === 'item') {
       // _contentIndent is relative to the column after the containers
       // before this item (blockquote columns shift per line).
@@ -1086,9 +1092,11 @@ function contentAt(P, li, stack) {
   // A tab that starts exactly at the strip boundary, after containers
   // were stripped, expands to spaces (its width at that column): e.g. a
   // tab at column 13 becomes 3 spaces. A tab with no container stripped
-  // (top level) stays a tab.
+  // (top level) stays a tab. Inner blockquote markers do not count
+  // toward the expansion column (see quoteDepth above).
   if (stripped && line[pos] === '\t') {
-    const w = 4 - (col % 4);
+    const effCol = quoteDepth > 1 ? col - 2 * (quoteDepth - 1) : col;
+    const w = 4 - (effCol % 4);
     return { content: (pad > 0 ? ' '.repeat(pad) : '') + ' '.repeat(w) + line.slice(pos + 1), col: col + w };
   }
   // A blank line keeps its whitespace content (code blocks need the spaces:
@@ -2508,6 +2516,7 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
     const raw = P.lines[k];
     if (isBlankFrom(raw, 0)) break;
     let quoteFails = false;
+    let itemIndentFails = false;
     {
       let p2 = 0, c2 = 0, pd2 = 0;
       for (let s = 1; s < stack.length; s++) {
@@ -2521,13 +2530,17 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
         } else if (b.t === 'item') {
           const want = c2 + b._contentIndent;
           const ind = indentFrom(raw, p2, c2, pd2);
-          if (ind.col < want) break;
+          if (ind.col < want) { itemIndentFails = true; break; }
           const adv = advanceTo(raw, p2, c2, pd2, want);
           p2 = adv.pos; c2 = adv.col; pd2 = adv.pad;
         }
       }
     }
     if (quoteFails) break;
+    // A column-0 line that starts a new list item is a new block, not
+    // fence content (doc-05 `* [x] ...` after a fenced blockquote). Plain
+    // column-0 text (e.g. `npm install ...`) is still absorbed.
+    if (itemIndentFails && /^(?:[*+-]|\d{1,9}[.)])[ \t]/.test(raw)) break;
     if (isFenceClose(raw, 0, 0, fence.ch, fence.len)) { k++; break; }
     lines.push(contentFromCol(raw, 0, fenceIndent));
     k++;
