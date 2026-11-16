@@ -2019,7 +2019,15 @@ function parseInlineNodes(text, refs) {
         for (let c2 = 0; c2 < d; c2++) {
           const cl2 = delims[c2];
           if (!cl2.active || cl2.kind !== closer.kind || !cl2.canClose || cl2.canOpen) continue;
-          if (cl2.len !== opener.len && cl2.len <= closer.len) continue;
+          // An earlier closer reserves the opener when it matches the
+          // opener's length or is longer than this closer — including
+          // when it is exactly this closer's length (doc-29
+          // `**cache ... *tokens ... **library ... *from our*** ...
+          // tests output***`: the earlier `***` must reserve `*from`
+          // and `**library` from the later `***`, as marked's
+          // left-to-right closer processing gives it priority; only a
+          // strictly shorter dangling closer must not reserve).
+          if (cl2.len !== opener.len && cl2.len < closer.len) continue;
           // Openers C' would consume (nearest first, up to C'.len).
           let need = cl2.len;
           let reserves = false;
@@ -2161,6 +2169,164 @@ function parseInlineNodes(text, refs) {
       }
     }
   }
+
+  // Marked's emphasis mask, step A: a lenient code-span scan over the
+  // paragraph. A backtick run pairs with the NEXT maximal run of the
+  // same length (content may hold backticks, must start/end non-backtick);
+  // a run with no partner is bare. Code-span inner backticks become '+'
+  // and escaped punctuation becomes '++' in the transformed string (all
+  // replacements length-preserving, so indices still match the source).
+  function maskTransform(s) {
+    const t = s.split('');
+    const n = s.length;
+    let i = 0;
+    while (i < n) {
+      const c = s[i];
+      if (c === '\\' && i + 1 < n && isPunct(s[i + 1])) { t[i] = '+'; t[i + 1] = '+'; i += 2; continue; }
+      if (c !== '`') { i++; continue; }
+      let run = 0;
+      while (i + run < n && s[i + run] === '`') run++;
+      // Nearest later maximal run of exactly `run` backticks, with at
+      // least one content char between the runs.
+      let close = -1;
+      let j = i + run + 1;
+      while (j < n) {
+        if (s[j] === '`') {
+          let m = j;
+          while (m < n && s[m] === '`') m++;
+          if (m - j === run) { close = m; break; }
+          j = m;
+        } else j++;
+      }
+      if (close < 0) { i += run; continue; }
+      for (let k = i + run; k < close - run; k++) if (t[k] === '`') t[k] = '+';
+      i = close;
+    }
+    return t.join('');
+  }
+
+  // Try to match marked's blockSkip link at t[p] === '[': a label of
+  // non-bracket chars and balanced backtick units, then '](...)'
+  // (destination: no spaces, one level of paren nesting). Returns the
+  // index just past ')' or -1.
+  function maskLinkEnd(t, p) {
+    const n = t.length;
+    let i = p + 1;
+    while (i < n) {
+      const c = t[i];
+      if (c === '`') {
+        // Balanced backtick unit: the FIRST later run must have the
+        // same length (content holds no backticks).
+        let run = 0;
+        while (i + run < n && t[i + run] === '`') run++;
+        let j = i + run;
+        if (j >= n || t[j] === '`') return -1;
+        while (j < n && t[j] !== '`') j++;
+        if (j >= n) return -1;
+        let m = j;
+        while (m < n && t[m] === '`') m++;
+        if (m - j !== run) return -1;
+        i = m;
+        continue;
+      }
+      if (c === '[' || c === ']') break;
+      i++;
+    }
+    if (i >= n || t[i] !== ']') return -1;
+    let j = i + 1;
+    if (j >= n || t[j] !== '(') return -1;
+    j++;
+    while (j < n) {
+      const c = t[j];
+      if (c === '\\' && j + 1 < n) { j += 2; continue; }
+      if (c === '(') {
+        j++;
+        while (j < n) {
+          const d = t[j];
+          if (d === '\\' && j + 1 < n) { j += 2; continue; }
+          if (d === '(' || d === ')' || d === ' ' || d === '\t' || d === '\n') break;
+          j++;
+        }
+        if (j >= n || t[j] !== ')') return -1;
+        j++;
+        continue;
+      }
+      if (c === ')') return j + 1;
+      if (c === ' ' || c === '\t' || c === '\n') return -1;
+      j++;
+    }
+    return -1;
+  }
+
+  // Try to match marked's blockSkip HTML tag at t[p] === '<': '<' not
+  // followed by a space, then no '<'/'>' until '>'. Returns the index
+  // just past '>' or -1.
+  function maskHtmlEnd(t, p) {
+    if (t[p + 1] === ' ') return -1;
+    let j = p + 1;
+    while (j < t.length) {
+      if (t[j] === '<' || t[j] === '>') break;
+      j++;
+    }
+    if (j < t.length && t[j] === '>') return j + 1;
+    return -1;
+  }
+
+  // Marked's emphasis mask, step B: scan the transformed string for
+  // blockSkip spans — inline links, code spans, HTML tags — and return
+  // the [start, end) ranges they cover. A stray backtick run inside a
+  // link label (e.g. `[docs each ``url`]`: its `` `` `` has no
+  // same-length partner inside the label, so the link does not match
+  // here) pairs with a later same-length run in step A, so step B sees
+  // one long code span from the label to that later run and blanks it
+  // whole: emphasis delimiters between the two never pair (doc-09/16/
+  // 28/35). The real tokenization is untouched — the link and the later
+  // code span still form — only emphasis is masked.
+  function emphasisMaskRanges() {
+    // No backtick, bracket, or angle bracket: no code span, link, or
+    // tag can occur, so nothing can be blanked — skip the whole pass.
+    if (!text.includes('`') && !text.includes('[') && !text.includes('<')) return [];
+    const t = maskTransform(text);
+    const n = t.length;
+    const ranges = [];
+    let p = 0;
+    while (p < n) {
+      const ch = t[p];
+      if (ch === '[') {
+        const end = maskLinkEnd(t, p);
+        if (end > 0) { ranges.push([p, end]); p = end; continue; }
+        p++;
+        continue;
+      }
+      if (ch === '`') {
+        let run = 0;
+        while (p + run < n && t[p + run] === '`') run++;
+        // The FIRST later run must have exactly `run` backticks
+        // (code-span content holds no backticks).
+        let j = p + run;
+        while (j < n && t[j] !== '`') j++;
+        if (j < n) {
+          let m = j;
+          while (m < n && t[m] === '`') m++;
+          if (m - j === run && j > p + run) { ranges.push([p, m]); p = m; continue; }
+        }
+        p += run;
+        continue;
+      }
+      if (ch === '<') {
+        const end = maskHtmlEnd(t, p);
+        if (end > 0) { ranges.push([p, end]); p = end; continue; }
+        p++;
+        continue;
+      }
+      p++;
+    }
+    return ranges;
+  }
+
+  // Blanked emphasis-mask ranges for this paragraph (computed once;
+  // they depend only on the paragraph text).
+  const maskRanges = emphasisMaskRanges();
 
   // Try to form a link/image at the current ']' (index i). Returns the
   // index just past the link syntax, or -1 when no link forms.
@@ -2660,6 +2826,18 @@ function parseInlineNodes(text, refs) {
     }
     addText(runText);
     i = j;
+  }
+  // Deactivate emphasis delimiters lying inside a masked span (see
+  // emphasisMaskRanges): marked never pairs them (doc-09/16/28/35).
+  // Link-text delimiters are already scoped out (finishLink splices
+  // them into their own range), so only top-level delimiters remain.
+  if (maskRanges.length > 0) {
+    for (const dm of delims) {
+      if (!dm.active || (dm.kind !== '*' && dm.kind !== '_' && dm.kind !== '~')) continue;
+      for (const [a, b] of maskRanges) {
+        if (dm.src > a && dm.src < b) { dm.active = false; break; }
+      }
+    }
   }
   processEmphasis();
   return nodes;
