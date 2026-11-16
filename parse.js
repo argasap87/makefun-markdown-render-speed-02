@@ -2498,6 +2498,10 @@ function parseInlineNodes(text, refs) {
       // a link node, the link cannot form (a link's text cannot contain
       // a link), so the `]` is free for the URL: doc-08
       // `(https://a.com)](https://b.com)` is one autolink, not two.
+      // And if the label cannot form a link at all (no inline `(` and
+      // no defined reference — doc-40 `[test render www.tiny.com]
+      // [library issues]`), the `]` is likewise free: marked's URL
+      // swallows `][library` into the autolink.
       let inLabel = false;
       for (let q = delims.length - 1; q >= 0; q--) {
         const dm = delims[q];
@@ -2511,7 +2515,23 @@ function parseInlineNodes(text, refs) {
               if (nd.children && containsLink(nd.children)) { hasLink = true; break; }
             }
           }
-          if (!hasLink) inLabel = true;
+          if (!hasLink && dm.src >= 0) {
+            const le = findLabelEnd(text, dm.src + 1);
+            if (le >= 0 && !labelHasUnclosedSpan(text.slice(dm.src + 1, le - 1))) {
+              const after = text[le];
+              if (after === '(') inLabel = true;
+              else if (after === '[') {
+                const re2 = findLabelEnd(text, le + 1);
+                if (re2 >= 0) {
+                  const refLab = text.slice(le + 1, re2 - 1);
+                  const key = refLab.length === 0 ? normLabel(text.slice(dm.src + 1, le - 1)) : normLabel(refLab);
+                  if (refs.has(key)) inLabel = true;
+                }
+              } else {
+                if (refs.has(normLabel(text.slice(dm.src + 1, le - 1)))) inLabel = true;
+              }
+            }
+          }
           break;
         }
       }
