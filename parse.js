@@ -2037,6 +2037,20 @@ function parseInlineNodes(text, refs) {
     }
   }
 
+  // Deactivate emphasis delimiters (* / _ / ~) whose source lies strictly
+  // inside a failed link label (openerSrc..closeIdx). Marked's emphasis
+  // masking hides a whole link-like `[...](...)` span from the emphasis
+  // parser, so `_` inside it never pairs (doc-09/16: `_node `` a ` b ``_`
+  // in `[at _node `` a ` b ``_](...)` stays literal).
+  function maskLabelEmphasis(openerSrc, closeIdx) {
+    for (const dm of delims) {
+      if (!dm.active) continue;
+      if ((dm.kind === '*' || dm.kind === '_' || dm.kind === '~') && dm.src > openerSrc && dm.src < closeIdx) {
+        dm.active = false;
+      }
+    }
+  }
+
   // Try to form a link/image at the current ']' (index i). Returns the
   // index just past the link syntax, or -1 when no link forms.
   function tryLink(closeIdx) {
@@ -2050,11 +2064,6 @@ function parseInlineNodes(text, refs) {
     if (di < 0) return -1;
     const opener = delims[di];
     const isImg = opener.kind === '![';
-    // A `]` inside an unclosed code span (marked's lenient label scan)
-    // does not end the label, so no link forms. Scan only the label
-    // text (opener..closeIdx), never past the `]`, so a backtick in the
-    // destination cannot confuse it.
-    if (labelHasUnclosedSpan(text.slice(opener.src + 1, closeIdx))) return -1;
     // Parse what follows the ']'.
     let j = closeIdx + 1;
     let href = null, title = null, endIdx = -1;
@@ -2082,6 +2091,15 @@ function parseInlineNodes(text, refs) {
         k++;
       }
       if (depth !== 0) return tryLinkCollapsed(di, opener, isImg, closeIdx, closeIdx + 1);
+      // A `]` inside an unclosed code span (marked's lenient label scan)
+      // does not end the label, so no link forms — and the whole
+      // link-like `[...](...)` span is hidden from the emphasis parser,
+      // so `_` inside the label never pairs (doc-09/16). Scan only the
+      // label text (opener..closeIdx), never past the `]`.
+      if (labelHasUnclosedSpan(text.slice(opener.src + 1, closeIdx))) {
+        maskLabelEmphasis(opener.src, closeIdx);
+        return -1;
+      }
       const inner = text.slice(j + 1, k - 1);
       const parsed = parseLinkInner(inner);
       // An unparsable `(...)` is not a link at all: fall back to the
@@ -2089,7 +2107,9 @@ function parseInlineNodes(text, refs) {
       if (!parsed) return tryLinkCollapsed(di, opener, isImg, closeIdx, closeIdx + 1);
       href = parsed.href; title = parsed.title; endIdx = k;
     } else if (text[j] === '[') {
-      // Reference link [text][label].
+      // Reference link [text][label]. A `]` inside an unclosed code span
+      // does not end the label (doc-18).
+      if (labelHasUnclosedSpan(text.slice(opener.src + 1, closeIdx))) return -1;
       const le = findLabelEnd(text, j);
       if (le < 0) return -1;
       const rawLabel = text.slice(j + 1, le - 1);
@@ -2110,7 +2130,9 @@ function parseInlineNodes(text, refs) {
         return tryLinkCollapsed(di, opener, isImg, closeIdx, endIdx);
       }
     } else {
-      // Shortcut reference: the label is the link text itself.
+      // Shortcut reference: the label is the link text itself. A `]`
+      // inside an unclosed code span does not end the label.
+      if (labelHasUnclosedSpan(text.slice(opener.src + 1, closeIdx))) return -1;
       return tryLinkCollapsed(di, opener, isImg, closeIdx, closeIdx + 1);
     }
     return finishLink(di, opener, isImg, href, title, endIdx);
@@ -2297,7 +2319,7 @@ function parseInlineNodes(text, refs) {
       }
       const node = { t: 'text', s: text.slice(i, i + run) };
       nodes.push(node);
-      pushDelim(c, run, canOpen, canClose, node);
+      pushDelim(c, run, canOpen, canClose, node, i);
       i += run;
       continue;
     }
