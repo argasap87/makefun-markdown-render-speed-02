@@ -1887,10 +1887,46 @@ function parseInlineNodes(text, refs) {
       clNode.s = clNode.s.slice(use);
       const emNode = { t: tag, children };
       // Rebuild the node range: [opener leftover?] + em + [closer leftover?].
+      // The closer leftover goes INSIDE the emphasis (as its last child)
+      // when it can no longer pair with any opener — no active opener of
+      // the same kind remains — AND the emphasis contains an inner
+      // em/strong AND the last child is attached to the closer (no leading
+      // whitespace). Marked's raw-span for the match then includes the
+      // whole closer run, so the leftover lands in the content
+      // (`**a *b*c***` -> `<strong>a <em>b</em>c*</strong>`). When an
+      // opener remains (e.g. doc-10 `*a *b **c*** d*`, where the `***`
+      // leftover must still close the inner `*b`), or there is no inner
+      // emphasis, or the last child starts with whitespace
+      // (`**a *b* c***`), the leftover stays outside as before.
       const replacement = [];
       if (opNode.s) replacement.push(opNode);
       replacement.push(emNode);
-      if (clNode.s) replacement.push(clNode);
+      let closerInside = false;
+      if (clNode.s) {
+        // Only a STRONG takes its closer leftover inside; an em never
+        // does (`*a *b*c**` -> `<em>a <em>b</em>c</em>*`, doc-03/doc-04).
+        let takeInside = false;
+        if (use === 2) {
+          const hasInnerEm = children.some(ch => ch.t === 'em' || ch.t === 'strong' || ch.t === 'del');
+          const lastCh = children[children.length - 1];
+          const attached = lastCh && lastCh.t === 'text' && lastCh.s !== '' && !/^[ \t\n]/.test(lastCh.s);
+          let openerRemains = false;
+          if (hasInnerEm && attached) {
+            for (const dm of delims) {
+              if (dm === closer || !dm.active || dm.len === 0 || dm.kind !== closer.kind || !dm.canOpen) continue;
+              openerRemains = true;
+              break;
+            }
+          }
+          takeInside = hasInnerEm && attached && !openerRemains;
+        }
+        if (takeInside) {
+          children.push({ t: 'text', s: clNode.s });
+          closerInside = true;
+        } else {
+          replacement.push(clNode);
+        }
+      }
       nodes.splice(opIdx, clIdx - opIdx + 1, ...replacement);
       if (opener.len === 0) { delims.splice(o, 1); if (o < d) d--; }
       if (closer.len === 0) {
