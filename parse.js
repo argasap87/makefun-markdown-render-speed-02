@@ -115,17 +115,21 @@ function cleanHref(href) {
 
 // Normalise a link label: unescape backslash-escaped punctuation, collapse
 // whitespace runs to one space, trim, lower-case.
-function normLabel(label) {
-  let out = '';
+// Does the label contain a `[` that is not backslash-escaped?
+function hasUnescapedBracket(label) {
   for (let i = 0; i < label.length; i++) {
-    if (label[i] === '\\' && i + 1 < label.length && isPunct(label[i + 1])) {
-      out += label[i + 1];
-      i++;
-    } else {
-      out += label[i];
-    }
+    if (label[i] === '\\') { i++; continue; }
+    if (label[i] === '[') return true;
   }
-  return out.replace(/\s+/g, ' ').trim().toLowerCase();
+  return false;
+}
+
+function normLabel(label) {
+  // Labels match after case folding + whitespace collapsing, WITHOUT
+  // unescaping backslashes: `[foo\!]` does not match `[foo!]` (cm-545),
+  // while `[Foo*bar\]]` matches itself (cm-194). Unicode case folding:
+  // ß (U+00DF) and ẞ (U+1E9E) both fold to "ss" (cm-540).
+  return label.replace(/ß|ẞ/g, 'ss').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 // Is the character at position i the start of a word character for the
@@ -274,8 +278,10 @@ function parseTitle(s, i) {
 // Find the index just past the matching ']' for the '[' at s[start],
 // skipping code spans and escaped brackets. Returns -1 if none.
 function findLabelEnd(s, start) {
+  // A label ends at the FIRST unescaped `]` (code spans aside). Nested
+  // brackets do NOT extend it: `[ref[bar]]` has label `ref[bar`, so it
+  // matches no definition (cm-547); `[[[foo]]]` likewise (cm-548).
   const n = s.length;
-  let depth = 0;
   let i = start;
   while (i < n) {
     const c = s[i];
@@ -288,12 +294,7 @@ function findLabelEnd(s, start) {
       i = close; continue;
     }
     if (c === '\\' && i + 1 < n) { i += 2; continue; }
-    if (c === '[') { depth++; i++; continue; }
-    if (c === ']') {
-      depth--;
-      if (depth === 0) return i + 1;
-      i++; continue;
-    }
+    if (c === ']') return i + 1;
     i++;
   }
   return -1;
@@ -320,6 +321,10 @@ function findCodeEnd(s, i, run) {
 // the link off, and a trailing ; / & is dropped.
 function trimUrl(u) {
   let end = u.length;
+  // A trailing `&...;` (entity-like) is not part of the URL (gfm-627
+  // `...&hl;` links only up to `commonmark`).
+  const em = /&[#A-Za-z0-9]+;$/.exec(u.slice(0, end));
+  if (em) end -= em[0].length;
   // An unmatched '(' truncates the link at the '('.
   let depth = 0;
   let cut = -1;
@@ -398,6 +403,9 @@ function scanHtmlTag(s, i) {
   let j = i + 1;
   if (s[j] === '!') {
     if (s.startsWith('<!--', j - 1)) {
+      // `<!-->` and `<!--->` are complete (abruptly closed) comments.
+      if (s.startsWith('<!-->', j - 1)) return j + 4;
+      if (s.startsWith('<!--->', j - 1)) return j + 6;
       const e = s.indexOf('-->', j + 3);
       if (e < 0) return n;
       return e + 3;
@@ -418,29 +426,41 @@ function scanHtmlTag(s, i) {
     return e + 2;
   }
   if (s[j] === '/') j++;
-  // Tag name.
+  const isClose = s[i + 1] === '/';
+  // Tag name (no `:`: `<m:abc>` is not a tag, cm-609).
   if (j >= n || !((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z'))) return -1;
   j++;
   while (j < n) {
     const c = s[j];
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '-' || c === ':') { j++; continue; }
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '-') { j++; continue; }
     break;
   }
-  // Attributes / close.
+  // A closing tag takes no attributes: only whitespace then `>`
+  // (`</a href="foo">` is not a tag, cm-624).
+  if (isClose) {
+    while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
+    if (s[j] === '>') return j + 1;
+    return -1;
+  }
+  // Attributes / close. An attribute must be preceded by whitespace
+  // (so `<m:abc>` is not a tag: `:` directly after the tag name, cm-609).
+  let sawSpace = false;
   while (j < n) {
     const c = s[j];
     if (c === '>') return j + 1;
     if (c === '/' && s[j + 1] === '>') return j + 2;
-    if (c === ' ' || c === '\t' || c === '\n') { j++; continue; }
+    if (c === ' ' || c === '\t' || c === '\n') { j++; sawSpace = true; continue; }
+    if (!sawSpace) return -1;
     // Attribute name.
     if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_' || c === ':')) return -1;
+    sawSpace = false;
     j++;
     while (j < n) {
       const d = s[j];
       if ((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') || (d >= '0' && d <= '9') || d === '_' || d === ':' || d === '.' || d === '-') { j++; continue; }
       break;
     }
-    while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
+    while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) { j++; sawSpace = true; }
     if (s[j] === '=') {
       j++;
       while (j < n && (s[j] === ' ' || s[j] === '\t' || s[j] === '\n')) j++;
@@ -605,6 +625,9 @@ function tryDef(P, i, pos) {
   }
   // After the title/destination, only spaces may follow on that line.
   if (!isBlankFrom(lines[endLine], endIdx)) return null;
+  // A label cannot contain an UNESCAPED `[` (cm-546 `[ref[]`); an escaped
+  // `\[` is a literal bracket and is fine (cm-549 `[ref\[]`).
+  if (hasUnescapedBracket(rawLabel)) return null;
   const label = normLabel(rawLabel);
   if (label.length === 0) return null;
   return { endLine, label, href, title };
@@ -696,6 +719,8 @@ function tryDef2(P, i, content, stack) {
     // a separate block, e.g. another definition).
   }
   if (!isBlankFrom(vline(endVk).text, endIdx)) return null;
+  // A label cannot contain an UNESCAPED `[` (cm-546); `\[` is fine (cm-549).
+  if (hasUnescapedBracket(rawLabel)) return null;
   const label = normLabel(rawLabel);
   if (label.length === 0) return null;
   return { endLine: vline(endVk).li, label, href, title };
@@ -931,7 +956,7 @@ function unescapePipe(s) {
 // Returns {endVk, endIdx} (just past the closing ]) and the raw label text
 // (with newlines kept), or null.
 function findLabelEndV(vline, vk, ci) {
-  let depth = 1;
+  // A label ends at the FIRST unescaped `]` (no nesting; cm-547/548).
   let a = vk, b = ci + 1;
   let raw = '';
   for (;;) {
@@ -949,12 +974,7 @@ function findLabelEndV(vline, vk, ci) {
         raw += s.slice(b, close); b = close; continue;
       }
       if (c === '\\' && b + 1 < s.length) { raw += s.slice(b, b + 2); b += 2; continue; }
-      if (c === '[') { depth++; raw += c; b++; continue; }
-      if (c === ']') {
-        depth--;
-        if (depth === 0) return { endVk: a, endIdx: b + 1, raw };
-        raw += c; b++; continue;
-      }
+      if (c === ']') return { endVk: a, endIdx: b + 1, raw };
       raw += c; b++;
     }
     const nx = vline(a + 1);
@@ -1633,8 +1653,8 @@ function parseInlineNodes(text, refs) {
   let inLink = false;
 
   function addText(s) { if (s) nodes.push({ t: 'text', s }); }
-  function pushDelim(kind, len, canOpen, canClose, node) {
-    delims.push({ kind, len, canOpen, canClose, node, active: true });
+  function pushDelim(kind, len, canOpen, canClose, node, src) {
+    delims.push({ kind, len, canOpen, canClose, node, active: true, src: src === undefined ? -1 : src });
   }
   // Resolve emphasis for the delimiters currently on the stack, in two
   // passes. Pass 1 pairs only same-length openers/closers (so `**` pairs
@@ -1755,10 +1775,12 @@ function parseInlineNodes(text, refs) {
         else if (c === ')') depth--;
         k++;
       }
-      if (depth !== 0) return -1;
+      if (depth !== 0) return tryLinkCollapsed(di, opener, isImg, closeIdx, closeIdx + 1);
       const inner = text.slice(j + 1, k - 1);
       const parsed = parseLinkInner(inner);
-      if (!parsed) return -1;
+      // An unparsable `(...)` is not a link at all: fall back to the
+      // shortcut reference `[foo]` (cm-568 `[foo](not a link)`).
+      if (!parsed) return tryLinkCollapsed(di, opener, isImg, closeIdx, closeIdx + 1);
       href = parsed.href; title = parsed.title; endIdx = k;
     } else if (text[j] === '[') {
       // Reference link [text][label].
@@ -1779,22 +1801,29 @@ function parseInlineNodes(text, refs) {
       endIdx = le;
       if (label === null) {
         // Mark for collapsed resolution after the link text is known.
-        return tryLinkCollapsed(di, opener, isImg, endIdx);
+        return tryLinkCollapsed(di, opener, isImg, closeIdx, endIdx);
       }
     } else {
       // Shortcut reference: the label is the link text itself.
-      return tryLinkCollapsed(di, opener, isImg, closeIdx + 1);
+      return tryLinkCollapsed(di, opener, isImg, closeIdx, closeIdx + 1);
     }
     return finishLink(di, opener, isImg, href, title, endIdx);
   }
 
-  // Resolve a collapsed/shortcut reference link: the label is the link text.
-  function tryLinkCollapsed(di, opener, isImg, endIdx) {
-    const opNode = opener.node;
-    const opIdx = nodes.indexOf(opNode);
-    if (opIdx < 0) return -1;
-    const textNodes = nodes.slice(opIdx + 1);
-    const labelText = plainText(textNodes);
+  // Resolve a collapsed/shortcut reference link: the label is the link
+  // text, taken RAW from the source (backslashes kept) so it matches the
+  // definition label exactly (cm-194 `[Foo*bar\]]`, cm-550 `[bar\\]`).
+  // Using the parsed plain text would strip the backslash and miss.
+  function tryLinkCollapsed(di, opener, isImg, closeIdx, endIdx) {
+    let labelText;
+    if (opener.src >= 0) {
+      labelText = text.slice(opener.src + 1, closeIdx);
+    } else {
+      const opNode = opener.node;
+      const opIdx = nodes.indexOf(opNode);
+      if (opIdx < 0) return -1;
+      labelText = plainText(nodes.slice(opIdx + 1));
+    }
     const ref = refs.get(normLabel(labelText));
     if (!ref) return -1;
     return finishLink(di, opener, isImg, ref.href, ref.title, endIdx);
@@ -1864,6 +1893,8 @@ function parseInlineNodes(text, refs) {
       if (i + 1 < n && text[i + 1] === '\n') {
         nodes.push({ t: 'br' });
         i += 2;
+        // After a hard break, the next line's leading spaces are stripped.
+        while (i < n && (text[i] === ' ' || text[i] === '\t')) i++;
         continue;
       }
       if (i + 1 < n && isPunct(text[i + 1])) {
@@ -1924,7 +1955,7 @@ function parseInlineNodes(text, refs) {
     if (c === '!' && text[i + 1] === '[') {
       const node = { t: 'text', s: '![' };
       nodes.push(node);
-      pushDelim('![', 1, true, false, node);
+      pushDelim('![', 1, true, false, node, i + 1);
       i += 2;
       continue;
     }
@@ -1932,7 +1963,7 @@ function parseInlineNodes(text, refs) {
     if (c === '[') {
       const node = { t: 'text', s: '[' };
       nodes.push(node);
-      pushDelim('[', 1, true, false, node);
+      pushDelim('[', 1, true, false, node, i);
       i++;
       continue;
     }
@@ -2000,7 +2031,7 @@ function parseInlineNodes(text, refs) {
     }
     // Bare autolinks (scheme / www) and emails, at a word boundary.
     // Suppressed inside a raw <a>...</a> (inLink).
-    if (!inLink && (c === 'h' || c === 'f' || c === 'w') && (i === 0 || !isAlphaNum(text[i - 1]))) {
+    if (!inLink && (c === 'h' || c === 'f' || c === 'w' || c === 'm' || c === 'x') && (i === 0 || !isAlphaNum(text[i - 1]))) {
       const auto = matchBareAutolink(text, i);
       if (auto) {
         nodes.push({ t: 'link', href: auto.href, title: null, children: [{ t: 'text', s: auto.text }] });
@@ -2026,7 +2057,7 @@ function parseInlineNodes(text, refs) {
           ch === '[' || ch === ']' || ch === '<' || ch === '&' || ch === '\n' ||
           (ch === '!' && text[j + 1] === '[')) break;
       const prev = j > 0 ? text[j - 1] : '';
-      if (!inLink && (ch === 'h' || ch === 'f' || ch === 'w') && !isAlphaNum(prev) &&
+      if (!inLink && (ch === 'h' || ch === 'f' || ch === 'w' || ch === 'm' || ch === 'x') && !isAlphaNum(prev) &&
           matchBareAutolink(text, j)) break;
       if (!inLink && isAlphaNum(ch) && !isEmailLocal(prev) && matchEmail(text, j)) break;
       j++;
@@ -2041,6 +2072,8 @@ function parseInlineNodes(text, refs) {
         addText(runText);
         nodes.push({ t: 'br' });
         i = j + 1;
+        // After a hard break, the next line's leading spaces are stripped.
+        while (i < n && (text[i] === ' ' || text[i] === '\t')) i++;
         continue;
       }
     }
@@ -2089,7 +2122,29 @@ function matchBareAutolink(text, i) {
   if (text.startsWith('http://', i)) scheme = 'http://';
   else if (text.startsWith('https://', i)) scheme = 'https://';
   else if (text.startsWith('ftp://', i)) scheme = 'ftp://';
-  else if (text.startsWith('www.', i)) {
+  else if (text.startsWith('mailto:', i)) {
+    // mailto:email — the whole `mailto:foo@bar.baz` is one link.
+    const em = matchEmail(text, i + 7);
+    if (!em) return null;
+    const url = 'mailto:' + em.text;
+    return { end: i + 7 + em.text.length, href: url, text: url };
+  } else if (text.startsWith('xmpp:', i)) {
+    // xmpp:email[/resource] — one optional `/segment` resource.
+    const em = matchEmail(text, i + 5);
+    if (!em) return null;
+    let end = i + 5 + em.text.length;
+    let url = 'xmpp:' + em.text;
+    if (text[end] === '/') {
+      let k = end + 1;
+      while (k < text.length) {
+        const ch = text[k];
+        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '<' || ch === '/') break;
+        k++;
+      }
+      if (k > end + 1) { url = text.slice(i, k); end = k; }
+    }
+    return { end, href: url, text: url };
+  } else if (text.startsWith('www.', i)) {
     if (i > 0) {
       const p = text[i - 1];
       if (!(p === ' ' || p === '\t' || p === '\n' || p === '(')) return null;
@@ -2140,6 +2195,10 @@ function matchEmail(text, i) {
   dom = trimUrl(dom);
   if (!dom || dom.indexOf('.') < 0) return null;
   if (dom[0] === '.' || dom[0] === '-' || dom[dom.length - 1] === '.' || dom[dom.length - 1] === '-') return null;
+  // The char after the domain must not be a word char or `-` (gfm-632
+  // `a.b-c_d@a.b_` is not an email: the `_` continues the identifier).
+  const after = text[ds + dom.length];
+  if (after !== undefined && (isAlphaNum(after) || after === '_' || after === '-')) return null;
   return { end: ds + dom.length, text: local + '@' + dom };
 }
 function canInterruptPara(marker, empty) {
