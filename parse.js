@@ -113,10 +113,19 @@ function cleanHref(href) {
   return escText(h);
 }
 
-// Normalise a link label: collapse whitespace runs to one space, trim,
-// lower-case.
+// Normalise a link label: unescape backslash-escaped punctuation, collapse
+// whitespace runs to one space, trim, lower-case.
 function normLabel(label) {
-  return label.replace(/\s+/g, ' ').trim().toLowerCase();
+  let out = '';
+  for (let i = 0; i < label.length; i++) {
+    if (label[i] === '\\' && i + 1 < label.length && isPunct(label[i + 1])) {
+      out += label[i + 1];
+      i++;
+    } else {
+      out += label[i];
+    }
+  }
+  return out.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 // Is the character at position i the start of a word character for the
@@ -183,7 +192,8 @@ function parseDest(s, i) {
     if (c === ' ' || c === '\t' || c === '\n' || c === '\r') break;
     if (c === '\\') {
       if (j + 1 < n && isPunct(s[j + 1])) { out += s[j + 1]; j += 2; continue; }
-      return null;
+      // Backslash before a non-punctuation char is a literal backslash.
+      out += '\\'; j++; continue;
     }
     if (c === '(') { depth++; out += c; j++; continue; }
     if (c === ')') {
@@ -199,6 +209,41 @@ function parseDest(s, i) {
 
 // Parse a link title starting at s[i] (the opening " ' or (). Returns
 // {title, end} or null.
+// Parse a link title that may span lines. vline(k) returns the k-th
+// virtual line {text} or null. Returns {title, endVk, endIdx} or null.
+// A title may contain single newlines but not a blank line.
+function parseTitleV(vline, vk, ci) {
+  const first = vline(vk);
+  if (!first) return null;
+  const q = first.text[ci];
+  if (q !== '"' && q !== "'" && q !== '(') return null;
+  const close = q === '(' ? ')' : q;
+  let a = vk, b = ci + 1;
+  let out = '';
+  for (;;) {
+    const v = vline(a);
+    if (!v) return null;
+    const s = v.text;
+    while (b < s.length) {
+      const c = s[b];
+      if (c === '\\' && b + 1 < s.length) {
+        const d = s[b + 1];
+        // Only a backslash before ASCII punctuation is an escape (the
+        // backslash is dropped); before any other char it stays literal.
+        if (isPunct(d)) { out += d; b += 2; continue; }
+      }
+      if (c === close) return { title: out, endVk: a, endIdx: b + 1 };
+      out += c; b++;
+    }
+    // End of line: a single newline is part of the title (unless the next
+    // line is blank, which ends the definition).
+    const nx = vline(a + 1);
+    if (!nx || isBlankFrom(nx.text, 0)) return null;
+    out += '\n';
+    a++; b = 0;
+  }
+}
+
 function parseTitle(s, i) {
   const n = s.length;
   const q = s[i];
@@ -210,11 +255,8 @@ function parseTitle(s, i) {
     const c = s[j];
     if (c === '\\' && j + 1 < n) {
       const d = s[j + 1];
-      if (q === '"' ? true : isPunct(d)) {
-        // In "..." titles any escaped char is allowed; in '...' and (...)
-        // titles only punctuation escapes.
-        if (q === '"' || isPunct(d)) { out += d; j += 2; continue; }
-      }
+      // Only a backslash before ASCII punctuation is an escape.
+      if (isPunct(d)) { out += d; j += 2; continue; }
     }
     if (c === close) return { title: out, end: j + 1 };
     if (q === "'" || q === '(') {
@@ -566,6 +608,7 @@ function tryDef(P, i, pos) {
   // After the title/destination, only spaces may follow on that line.
   if (!isBlankFrom(lines[endLine], endIdx)) return null;
   const label = normLabel(rawLabel);
+  if (label.length === 0) return null;
   return { endLine, label, href, title };
 }
 
@@ -578,11 +621,6 @@ function tryDef2(P, i, content, stack) {
   if (ind.col > 3) return null;
   const j = ind.idx;
   if (content[j] !== '[') return null;
-  const labelEnd = findLabelEnd(content, j);
-  if (labelEnd < 0) return null;
-  const rawLabel = content.slice(j + 1, labelEnd - 1);
-  if (rawLabel.length === 0 || rawLabel.length > 999) return null;
-  if (content[labelEnd] !== ':') return null;
   // Virtual lines: index 0 is `content`; later lines come from contentAt.
   const vlines = [{ text: content, li: i }];
   function vline(k) {
@@ -595,6 +633,15 @@ function tryDef2(P, i, content, stack) {
     }
     return vlines[k];
   }
+  // The label may span lines: find its end across the virtual lines.
+  const lab = findLabelEndV(vline, 0, j);
+  if (!lab) return null;
+  const rawLabel = lab.raw;
+  if (rawLabel.length === 0 || rawLabel.length > 999) return null;
+  const labEndLine = vline(lab.endVk).text;
+  if (labEndLine[lab.endIdx] !== ':') return null;
+  const labelEnd = lab.endIdx;
+  const labelEndVk = lab.endVk;
   // Advance (vk, ci) over spaces, tabs and single newlines (never a blank
   // line). Returns {vk, ci} or null.
   function skipSpace(vk0, ci0) {
@@ -610,7 +657,7 @@ function tryDef2(P, i, content, stack) {
       a++; b = 0;
     }
   }
-  const ok = skipSpace(0, labelEnd + 1);
+  const ok = skipSpace(labelEndVk, labelEnd + 1);
   if (!ok) return null;
   const dline = vline(ok.vk).text;
   const dest = parseDest(dline, ok.ci);
@@ -623,10 +670,25 @@ function tryDef2(P, i, content, stack) {
     const tline = vline(sp.vk).text;
     const q = tline[sp.ci];
     if (q === '"' || q === "'" || q === '(') {
-      const t = parseTitle(tline, sp.ci);
-      if (!t) return null;
-      title = t.title;
-      endVk = sp.vk; endIdx = t.end;
+      // A title must be separated from the destination by whitespace
+      // (a space, tab, or newline). <bar>(baz) has none, so it is not a
+      // title and the definition is invalid.
+      const hadSep = sp.vk !== ok.vk || sp.ci > dest.end;
+      if (!hadSep) return null;
+      const t = parseTitleV(vline, sp.vk, sp.ci);
+      if (!t) {
+        // A malformed title on a LATER line does not kill the definition:
+        // it ends at the destination and the title line is a separate
+        // block. (On the same line, a bad title kills it.)
+        if (sp.vk === ok.vk) return null;
+      } else if (!isBlankFrom(vline(t.endVk).text, t.endIdx)) {
+        // Junk after the title: same fallback, unless the title is on the
+        // destination's own line.
+        if (t.endVk === ok.vk) return null;
+      } else {
+        title = t.title;
+        endVk = t.endVk; endIdx = t.endIdx;
+      }
     } else if (sp.vk === ok.vk) {
       // Junk after the destination on the same line -> invalid definition.
       if (!isBlankFrom(tline, sp.ci)) return null;
@@ -636,7 +698,9 @@ function tryDef2(P, i, content, stack) {
     // a separate block, e.g. another definition).
   }
   if (!isBlankFrom(vline(endVk).text, endIdx)) return null;
-  return { endLine: vline(endVk).li, label: normLabel(rawLabel), href, title };
+  const label = normLabel(rawLabel);
+  if (label.length === 0) return null;
+  return { endLine: vline(endVk).li, label, href, title };
 }
 
 // Advance (li, ci) over spaces, tabs and single newlines (never a blank
@@ -864,6 +928,44 @@ function unescapePipe(s) {
   return out;
 }
 
+// Find the end of a [...] label that may span lines. vline(k) returns the
+// k-th virtual line {text} or null. Starts at (vk, ci) which must be '['.
+// Returns {endVk, endIdx} (just past the closing ]) and the raw label text
+// (with newlines kept), or null.
+function findLabelEndV(vline, vk, ci) {
+  let depth = 1;
+  let a = vk, b = ci + 1;
+  let raw = '';
+  for (;;) {
+    const v = vline(a);
+    if (!v) return null;
+    const s = v.text;
+    while (b < s.length) {
+      const c = s[b];
+      if (c === '`') {
+        let k = b;
+        while (k < s.length && s[k] === '`') k++;
+        const run = k - b;
+        const close = findCodeEnd(s, k, run);
+        if (close < 0) { raw += s.slice(b, k); b = k; continue; }
+        raw += s.slice(b, close); b = close; continue;
+      }
+      if (c === '\\' && b + 1 < s.length) { raw += s.slice(b, b + 2); b += 2; continue; }
+      if (c === '[') { depth++; raw += c; b++; continue; }
+      if (c === ']') {
+        depth--;
+        if (depth === 0) return { endVk: a, endIdx: b + 1, raw };
+        raw += c; b++; continue;
+      }
+      raw += c; b++;
+    }
+    const nx = vline(a + 1);
+    if (!nx || isBlankFrom(nx.text, 0)) return null;
+    raw += '\n';
+    a++; b = 0;
+  }
+}
+
 // Is the line a table delimiter row? Returns the alignments array or null.
 function tableDelimiter(s) {
   const cells = splitTableRow(s);
@@ -951,9 +1053,12 @@ function contentAt(P, li, stack) {
       if (!m) return null;
       pos = m.pos; col = m.col; pad = m.pad;
     } else if (b.t === 'item') {
+      // _contentIndent is relative to the column after the containers
+      // before this item (blockquote columns shift per line).
+      const want = col + b._contentIndent;
       const ind = indentFrom(line, pos, col, pad);
-      if (ind.col < b._contentIndent) return null;
-      const adv = advanceTo(line, pos, col, pad, b._contentIndent);
+      if (ind.col < want) return null;
+      const adv = advanceTo(line, pos, col, pad, want);
       pos = adv.pos; col = adv.col; pad = adv.pad;
     }
   }
@@ -1026,9 +1131,12 @@ function parseBlocks(src, refs) {
 
   while (i < n) {
     const line = P.lines[i];
-    // Fully blank line: closes a paragraph, never closes containers.
+    // Fully blank line: closes a paragraph and any open blockquotes (a
+    // bare blank line has no > marker, so the quote ends here; a later >
+    // line starts a NEW blockquote). Lists survive blank lines.
     if (isBlankFrom(line, 0)) {
       closePara();
+      while (stack.length > 1 && stack[stack.length - 1].t === 'quote') stack.pop();
       lastBlank = true;
       i++;
       continue;
@@ -1045,9 +1153,10 @@ function parseBlocks(src, refs) {
         if (!m) { failAt = s; break; }
         pos = m.pos; col = m.col; pad = m.pad;
       } else if (b.t === 'item') {
+        const want = col + b._contentIndent;
         const ind = indentFrom(line, pos, col, pad);
-        if (ind.col < b._contentIndent) { failAt = s; break; }
-        const adv = advanceTo(line, pos, col, pad, b._contentIndent);
+        if (ind.col < want) { failAt = s; break; }
+        const adv = advanceTo(line, pos, col, pad, want);
         pos = adv.pos; col = adv.col; pad = adv.pad;
       }
     }
@@ -1056,9 +1165,26 @@ function parseBlocks(src, refs) {
       // NOT start a block that can interrupt a paragraph, it is a lazy
       // continuation line of that paragraph; otherwise close the containers
       // and let phase 2 start the new block.
-      const lazyContent = (pad > 0 ? ' '.repeat(pad) : '') + line.slice(pos);
+      const lazyContent0 = (pad > 0 ? ' '.repeat(pad) : '') + line.slice(pos);
       if (stack.length > 0 && stack[stack.length - 1].t === 'para' &&
-          !startsInterruptingBlock(P, i, lazyContent, col, stack)) {
+          !startsInterruptingBlock(P, i, lazyContent0, col, stack)) {
+        // A lazy continuation line indented 4+ columns loses 4 columns of
+        // leading whitespace (the indented-code indent); a less-indented
+        // line keeps its whitespace verbatim. A tab straddling the 4-col
+        // boundary leaves the leftover as spaces.
+        let lazyContent = lazyContent0;
+        let cc = col;
+        let k = 0;
+        let leftover = 0;
+        while (k < lazyContent.length && (lazyContent[k] === ' ' || lazyContent[k] === '\t')) {
+          const w = lazyContent[k] === '\t' ? 4 - (cc % 4) : 1;
+          if (cc + w > col + 4) { leftover = cc + w - (col + 4); k++; break; }
+          cc += w; k++;
+          if (cc - col >= 4) break;
+        }
+        if (cc - col >= 4 || leftover > 0) {
+          lazyContent = ' '.repeat(leftover) + lazyContent.slice(k);
+        }
         const p = stack[stack.length - 1];
         p.lines.push(lazyContent);
         lastBlank = false;
@@ -1069,8 +1195,19 @@ function parseBlocks(src, refs) {
       // Phase 2 continues at the position after the matched containers.
       // (pos, col, pad) are still the pre-failure values, as desired.
     }
-    // Blank after container markers: a blank line.
+    // Blank after container markers: a markers-only line (empty content,
+    // e.g. `>>`) is a blank line that ends the paragraph. A line with
+    // whitespace content after the markers (e.g. `>  `) continues an open
+    // paragraph as a line of spaces; with no paragraph open it is blank.
     if (isBlankFrom(line, pos)) {
+      const ws = (pad > 0 ? ' '.repeat(pad) : '') + line.slice(pos);
+      if (ws.length > 0 && stack.length > 0 && stack[stack.length - 1].t === 'para') {
+        const p = stack[stack.length - 1];
+        p.lines.push(ws);
+        lastBlank = false;
+        i++;
+        continue;
+      }
       closePara();
       lastBlank = true;
       i++;
@@ -1081,6 +1218,15 @@ function parseBlocks(src, refs) {
     // ---- Phase 2: start new blocks (possibly several containers). ----
     while (true) {
       const paraOpen = stack.length > 0 && stack[stack.length - 1].t === 'para';
+      // Blank content with no paragraph open (e.g. a bare `>` line) is a
+      // blank line: it must NOT start an empty paragraph. (When a
+      // paragraph IS open, the line is a continuation and is added below.)
+      if (isBlankFrom(content, 0) && !paraOpen) {
+        closePara();
+        lastBlank = true;
+        i++;
+        break;
+      }
       const inPara = paraOpen;
       if (paraOpen) {
         // Setext underline turns the paragraph into a heading.
@@ -1988,7 +2134,7 @@ function startListItem(P, i, stack, marker, content, ccol, lastBlank) {
   } else if (lastBlank && list.items.length > 0) {
     list.tight = false;
   }
-  const item = { t: 'item', children: [], _contentIndent: contentIndent, _list: list };
+  const item = { t: 'item', children: [], _contentIndent: contentIndent - ccol, _list: list };
   if (task !== undefined) item._task = task;
   list.items.push(item);
   stack.push(item);
@@ -2027,18 +2173,25 @@ function parseIndentedCode(P, i, stack, content, ccol, lastBlank) {
   const lines = [];
   let k = i;
   const n = P.lines.length;
+  // Blank lines are held as pending: they only join the code block if a
+  // later non-blank line is still indented code. Otherwise the block ends
+  // BEFORE the first pending blank line, so the main loop sees it (and a
+  // bare blank line can close an enclosing blockquote).
+  let pending = [];
+  let pendingStart = -1;
   while (k < n) {
     const c = k === i ? { content, col: ccol } : contentAt(P, k, stack);
     if (!c) break;
     if (isBlankFrom(c.content, 0)) {
-      // A whitespace-only line keeps its content minus the 4-space indent
-      // (e.g. 6 spaces -> 2 spaces), not an empty string.
-      lines.push(contentFromCol(c.content, c.col, c.col + 4));
+      if (pendingStart < 0) pendingStart = k;
+      pending.push(contentFromCol(c.content, c.col, c.col + 4));
       k++;
       continue;
     }
     const ind = indentOf(c.content, 0, c.col);
     if (ind.col - c.col < 4) break;
+    for (const pl of pending) lines.push(pl);
+    pending = []; pendingStart = -1;
     lines.push(contentFromCol(c.content, c.col, c.col + 4));
     k++;
   }
@@ -2049,7 +2202,9 @@ function parseIndentedCode(P, i, stack, content, ccol, lastBlank) {
   const parent = blockParent(stack);
   markLoose(parent, lastBlank);
   parent.children.push({ t: 'code', fenced: false, info: '', text });
-  return k;
+  // If we stopped at a non-code line with pending blank lines, resume at
+  // the first pending blank line so the main loop sees it.
+  return pendingStart >= 0 ? pendingStart : k;
 }
 
 // Parse an HTML block. hb = {type, endLine} from htmlBlockAt. Returns the
@@ -2160,7 +2315,13 @@ function htmlBlockAt(P, i, content, ccol, inPara, stack) {
         k++;
       }
       if (BLOCK_TAG_SET.has(name)) return { type: 6, endLine: k };
-      if (!inPara && scanHtmlTag(content, j) > 0) return { type: 7, endLine: k };
+      // Type 7: a complete non-block tag that is alone on the line (only
+      // whitespace may follow it); otherwise it is inline HTML in a
+      // paragraph, e.g. <del>*foo*</del>.
+      if (!inPara) {
+        const te = scanHtmlTag(content, j);
+        if (te > 0 && isBlankFrom(content, te)) return { type: 7, endLine: k };
+      }
     }
   }
   return null;
