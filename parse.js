@@ -1709,19 +1709,23 @@ function parseInlineNodes(text, refs) {
       // (cm-429 `**foo*bar*baz**`: the `*` after `foo` opens `<em>bar</em>`).
       let o = -1;
       let fallback = -1;
-      let blocked = false;
+      let hitBlocker = false;
+      let blockerIdx = -1;
       for (let j = d - 1; j >= 0; j--) {
         const op = delims[j];
         if (!op.active || op.kind !== closer.kind || !op.canOpen) continue;
         // A BLOCKER (an open-capable closer left behind by an inner
-        // strong/em) stops the search when the rule of 3 applies: the
-        // closer cannot reach an opener before the blocker (`*a **b**c*`,
-        // doc-03/doc-07). A blocker is single-use: the first closer that
-        // encounters it deactivates it, so a LATER closer (e.g. the final
-        // `*` in `*a **b**c*d*e*`) can still match the outer opener.
+        // strong/em) bars the closer from an opener before it when the
+        // rule of 3 applies (`*a **b**c*`, doc-03/doc-07). It is
+        // single-use (deactivated on encounter). It only permanently
+        // blocks when it actually prevents a match: an opener found past
+        // it (before it) is barred, but an opener after it — including a
+        // pass-1 fallback opener nearer the closer — is not (doc-03
+        // `*using *type guide in**`: the `**` closer has no same-length
+        // opener in pass 1, so it must retry in pass 2).
         if (op.isBlocker) {
           op.active = false;
-          if ((op.len + closer.len) % 3 === 0) { blocked = true; break; }
+          if ((op.len + closer.len) % 3 === 0) { hitBlocker = true; blockerIdx = j; }
           continue;
         }
         if (sameLengthOnly && op.len !== closer.len) {
@@ -1735,8 +1739,12 @@ function parseInlineNodes(text, refs) {
         break;
       }
       if (o < 0 && sameLengthOnly && fallback >= 0) o = fallback;
-      if (blocked) closer.blockedForever = true;
-      if (blocked || o < 0) { d += step; continue; }
+      // A blocker only permanently blocks when it prevented a real match:
+      // the opener found lies before the blocker. A fallback opener after
+      // the blocker is unaffected.
+      const barred = hitBlocker && o >= 0 && o < blockerIdx;
+      if (barred) closer.blockedForever = true;
+      if (barred || o < 0) { d += step; continue; }
       const opener = delims[o];
       // Earlier-closer priority (both passes): if an earlier PURE closer
       // C' (same kind, still active, canClose but not canOpen) would
