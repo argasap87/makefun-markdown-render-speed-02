@@ -2871,10 +2871,12 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
       }
     }
     if (quoteFails) break;
-    // A column-0 line that starts a new list item is a new block, not
-    // fence content (doc-05 `* [x] ...` after a fenced blockquote). Plain
-    // column-0 text (e.g. `npm install ...`) is still absorbed.
-    if (itemIndentFails && /^(?:[*+-]|\d{1,9}[.)])[ \t]/.test(raw)) break;
+    // A line that starts a new list item is a new block, not fence
+    // content (doc-05 `* [x] ...` after a fenced blockquote; doc-21
+    // `  - b` after a fence in a nested blockquote). The marker may be
+    // indented up to 3 spaces (a list item at the enclosing list's
+    // level). Plain text (e.g. `npm install ...`) is still absorbed.
+    if (itemIndentFails && /^ {0,3}(?:[*+-]|\d{1,9}[.)])[ \t]/.test(raw)) break;
     if (isFenceClose(raw, 0, 0, fence.ch, fence.len)) { k++; break; }
     lines.push(contentFromCol(raw, 0, fenceIndent));
     k++;
