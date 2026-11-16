@@ -2163,8 +2163,11 @@ function parseInlineNodes(text, refs) {
       // label: `[docs each ``url`]` has an unmatched `` `` `` (closing
       // run is a single backtick), and the matching `` `` `` on a later
       // line must not swallow the `]` — the link forms and the
-      // backticks stay literal inside it. If the strict closing run
-      // lies past the label's `]`, treat these backticks as literal.
+      // backticks stay literal inside it. Only when the opening
+      // backtick is INSIDE the label (before its `]`) and the strict
+      // closing run lies past it; a backtick after the label's `]`
+      // (e.g. doc-12 `` `max_width` `` after a nested-link label)
+      // is outside the label and forms a code span normally.
       let labelEnd = -1;
       for (let j = delims.length - 1; j >= 0; j--) {
         const dm = delims[j];
@@ -2173,7 +2176,7 @@ function parseInlineNodes(text, refs) {
           break;
         }
       }
-      if (labelEnd >= 0 && close > labelEnd) {
+      if (labelEnd >= 0 && i < labelEnd && close > labelEnd) {
         addText(text.slice(i, i + run));
         i += run;
         continue;
