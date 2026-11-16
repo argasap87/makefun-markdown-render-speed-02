@@ -1175,6 +1175,12 @@ function parseBlocks(src, refs) {
   const n = P.lines.length;
   let i = 0;
   let lastBlank = true;
+  // Depth-scoped blank: the stack depth (stack.length) at which the most
+  // recent blank line occurred. A blank inside a nested container (e.g.
+  // a `>`-only line inside a blockquote within a list item, cm-320)
+  // must not loosen the enclosing list — only a blank at or above the
+  // item's own depth counts. -1 when no blank is pending.
+  let lastBlankDepth = -1;
 
   function container() {
     for (let s = stack.length - 1; s >= 0; s--) {
@@ -1199,8 +1205,11 @@ function parseBlocks(src, refs) {
     const parent = container();
     parent.children.push(node);
     // Looseness: a block added to a list item after a blank line, when the
-    // item already has a block, makes its list loose.
-    if (parent.t === 'item' && parent.children.length > 1 && lastBlank) {
+    // item already has a block, makes its list loose — but only if the
+    // blank occurred at or above the item's own depth (cm-320: a blank
+    // inside a nested blockquote does not loosen the enclosing list).
+    if (parent.t === 'item' && parent.children.length > 1 && lastBlank &&
+        (lastBlankDepth < 0 || lastBlankDepth <= stack.indexOf(parent) + 1)) {
       parent._list.tight = false;
     }
     return node;
@@ -1215,6 +1224,12 @@ function parseBlocks(src, refs) {
       closePara();
       while (stack.length > 1 && stack[stack.length - 1].t === 'quote') stack.pop();
       lastBlank = true;
+      // A BARE blank line separates blocks at every ancestor level (it
+      // ends nested containers), so it may loosen any enclosing list
+      // (cm-325/326). Depth 0 means "loosens any list". A markers-only
+      // blank (below) is confined to its container and gets the real
+      // (deep) stack depth instead.
+      lastBlankDepth = 0;
       i++;
       continue;
     }
@@ -1315,6 +1330,7 @@ function parseBlocks(src, refs) {
       }
       closePara();
       lastBlank = true;
+      lastBlankDepth = stack.length;
       i++;
       continue;
     }
@@ -1334,6 +1350,7 @@ function parseBlocks(src, refs) {
         if (!(top && top.t === 'item' && top.children.length === 0)) {
           closePara();
           lastBlank = true;
+          lastBlankDepth = stack.length;
         }
         i++;
         break;
@@ -1367,7 +1384,7 @@ function parseBlocks(src, refs) {
             if (del && del.length === hdr.length && dind.col - nx.col <= 3 &&
                 setextLevel(nx.content, 0, nx.col) === 0) {
               closePara();
-              i = parseTable(P, i, stack, hdr, del, content, ccol, lastBlank);
+              i = parseTable(P, i, stack, hdr, del, content, ccol, lastBlank, lastBlankDepth);
               lastBlank = false;
               break;
             }
@@ -1386,14 +1403,14 @@ function parseBlocks(src, refs) {
       const fence = fenceStart(content, 0, ccol);
       if (fence) {
         closePara();
-        i = parseFenced(P, i, stack, fence, content, ccol, lastBlank);
+        i = parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDepth);
         lastBlank = false;
         break;
       }
       const hb = htmlBlockAt(P, i, content, ccol, inPara, stack);
       if (hb) {
         closePara();
-        i = parseHtmlBlock(P, i, stack, hb, content, ccol, lastBlank);
+        i = parseHtmlBlock(P, i, stack, hb, content, ccol, lastBlank, lastBlankDepth);
         lastBlank = false;
         break;
       }
@@ -1416,7 +1433,7 @@ function parseBlocks(src, refs) {
         const inList = stack.some(b => b.t === 'item');
         if (!paraOpen || inList || canInterruptPara(marker, empty)) {
           closePara();
-          const res = startListItem(P, i, stack, marker, content, ccol, lastBlank);
+          const res = startListItem(P, i, stack, marker, content, ccol, lastBlank, lastBlankDepth);
           if (res) {
             content = res.content; ccol = res.col; i = res.line;
             lastBlank = false;
@@ -1451,7 +1468,7 @@ function parseBlocks(src, refs) {
         const def = tryDef2(P, i, content, stack);
         if (def) {
           if (!refs.has(def.label)) refs.set(def.label, { href: def.href, title: def.title });
-          markLoose(container(), lastBlank);
+          markLoose(container(), lastBlank, lastBlankDepth, stack);
           i = def.endLine + 1;
           lastBlank = false;
           break;
@@ -1459,7 +1476,7 @@ function parseBlocks(src, refs) {
         // Indented code (4+ spaces, no paragraph open).
         const ind = indentOf(content, 0, ccol);
         if (ind.col - ccol >= 4) {
-          i = parseIndentedCode(P, i, stack, content, ccol, lastBlank);
+          i = parseIndentedCode(P, i, stack, content, ccol, lastBlank, lastBlankDepth);
           lastBlank = false;
           break;
         }
@@ -1472,7 +1489,7 @@ function parseBlocks(src, refs) {
             const dind = indentOf(nx.content, 0, nx.col);
             if (del && del.length === hdr.length && dind.col - nx.col <= 3 &&
                 setextLevel(nx.content, 0, nx.col) === 0) {
-              i = parseTable(P, i, stack, hdr, del, content, ccol, lastBlank);
+              i = parseTable(P, i, stack, hdr, del, content, ccol, lastBlank, lastBlankDepth);
               lastBlank = false;
               break;
             }
@@ -1509,9 +1526,15 @@ function blockParent(stack) {
 
 // Mark the parent list loose when a block is added to a list item that
 // already holds a block after a blank line.
-function markLoose(parent, lastBlank) {
+function markLoose(parent, lastBlank, lastBlankDepth, stack) {
+  // Depth-scoped: a blank inside a nested container (deeper than the
+  // item) does not loosen the list (cm-320). When no depth/stack is
+  // supplied, fall back to the old behaviour.
   if (parent.t === 'item' && parent.children.length > 0 && lastBlank) {
-    parent._list.tight = false;
+    if (lastBlankDepth === undefined || !stack ||
+        lastBlankDepth < 0 || lastBlankDepth <= stack.indexOf(parent) + 1) {
+      parent._list.tight = false;
+    }
   }
 }
 
@@ -2562,7 +2585,7 @@ function canInterruptPara(marker, empty) {
 // Start (or continue) a list for the marker at (content, ccol). Creates the
 // list/item, pushes the item, and returns the item's first content
 // {content, col, line} or null. `line` is the current line index.
-function startListItem(P, i, stack, marker, content, ccol, lastBlank) {
+function startListItem(P, i, stack, marker, content, ccol, lastBlank, lastBlankDepth) {
   // Content indent: marker start + marker width + following spaces (1-4
   // spaces; 5+ means only 1 column is consumed, the rest is content).
   const ind = indentOf(content, 0, ccol);
@@ -2627,9 +2650,14 @@ function startListItem(P, i, stack, marker, content, ccol, lastBlank) {
   }
   if (!list) {
     list = { t: 'list', ordered: marker.ordered, start: marker.start, tight: true, items: [], _markerIndent: mcol, _delim: marker.delim };
-    markLoose(parent, lastBlank);
+    markLoose(parent, lastBlank, lastBlankDepth, stack);
     kids.push(list);
-  } else if (lastBlank && list.items.length > 0) {
+  } else if (lastBlank && list.items.length > 0 &&
+      (lastBlankDepth === undefined || lastBlankDepth < 0 ||
+       lastBlankDepth <= stack.indexOf(parent) + 2)) {
+    // Depth-scoped (cm-320): a blank inside a nested container (e.g. a
+    // `>`-only line in a blockquote within the previous item) does not
+    // loosen the list; only a blank at or above the list's level does.
     list.tight = false;
   }
   const item = { t: 'item', children: [], _contentIndent: contentIndent - ccol, _list: list };
@@ -2640,7 +2668,7 @@ function startListItem(P, i, stack, marker, content, ccol, lastBlank) {
 }
 
 // Parse a fenced code block starting at line i. Returns the next line index.
-function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
+function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDepth) {
   const lines = [];
   let k = i + 1;
   const n = P.lines.length;
@@ -2722,7 +2750,7 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
   if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   const text = lines.length === 0 ? '' : lines.join('\n') + '\n';
   const parent = blockParent(stack);
-  markLoose(parent, lastBlank);
+  markLoose(parent, lastBlank, lastBlankDepth, stack);
   parent.children.push({ t: 'code', fenced: true, info: fence.info, text });
   return k;
 }
@@ -2731,7 +2759,7 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
 // Line i uses the already container-stripped `content` (it may be the list
 // marker line, which contentAt could not re-derive); later lines go through
 // contentAt.
-function parseIndentedCode(P, i, stack, content, ccol, lastBlank) {
+function parseIndentedCode(P, i, stack, content, ccol, lastBlank, lastBlankDepth) {
   const lines = [];
   let k = i;
   const n = P.lines.length;
@@ -2762,7 +2790,7 @@ function parseIndentedCode(P, i, stack, content, ccol, lastBlank) {
   while (lines.length > 0 && isBlankFrom(lines[lines.length - 1], 0)) lines.pop();
   const text = lines.length === 0 ? '' : lines.join('\n') + '\n';
   const parent = blockParent(stack);
-  markLoose(parent, lastBlank);
+  markLoose(parent, lastBlank, lastBlankDepth, stack);
   parent.children.push({ t: 'code', fenced: false, info: '', text });
   // If we stopped at a non-code line with pending blank lines, resume at
   // the first pending blank line so the main loop sees it.
@@ -2772,9 +2800,9 @@ function parseIndentedCode(P, i, stack, content, ccol, lastBlank) {
 // Parse an HTML block. hb = {type, endLine} from htmlBlockAt. Returns the
 // next line index. The block's lines are the container-stripped content
 // lines (blockquote/list markers are not part of the HTML output).
-function parseHtmlBlock(P, i, stack, hb, content, ccol, lastBlank) {
+function parseHtmlBlock(P, i, stack, hb, content, ccol, lastBlank, lastBlankDepth) {
   const parent = blockParent(stack);
-  markLoose(parent, lastBlank);
+  markLoose(parent, lastBlank, lastBlankDepth, stack);
   const rawLines = [content];
   for (let k = i + 1; k <= hb.endLine; k++) {
     const c = contentAt(P, k, stack);
@@ -2797,7 +2825,7 @@ function parseHtmlBlock(P, i, stack, hb, content, ccol, lastBlank) {
 // Parse a table starting at line i (header = current line, delimiter = next
 // line). Returns the next line index. Rows are padded with empty cells or
 // truncated to the header cell count.
-function parseTable(P, i, stack, hdr, del, content, ccol, lastBlank) {
+function parseTable(P, i, stack, hdr, del, content, ccol, lastBlank, lastBlankDepth) {
   const rows = [];
   let k = i + 2;
   const n = P.lines.length;
@@ -2824,7 +2852,7 @@ function parseTable(P, i, stack, hdr, del, content, ccol, lastBlank) {
     k++;
   }
   const parent = blockParent(stack);
-  markLoose(parent, lastBlank);
+  markLoose(parent, lastBlank, lastBlankDepth, stack);
   parent.children.push({ t: 'table', aligns: del, header: hdr, rows });
   return k;
 }
