@@ -820,7 +820,9 @@ function htmlBlockStart(P, i, pos, col, inPara) {
   // Type 1: script, pre, style, textarea (case-insensitive). Ends at the
   // first line containing the matching closing tag (blank lines do not end
   // it), or at the end of the document.
-  const m1 = /^<\/?(script|pre|style|textarea)(?=[\s>\/]|$)/i.exec(rest);
+  // Type 1 starts only with the OPENING tag <pre>/<script>/<style>/
+  // <textarea>; a closing tag alone (</pre>) is paragraph text (cm-148).
+  const m1 = /^<(script|pre|style|textarea)(?=[\s>\/]|$)/i.exec(rest);
   if (m1) {
     const tag = m1[1].toLowerCase();
     const closeRe = new RegExp('</' + tag + '\\s*>', 'i');
@@ -882,8 +884,8 @@ function htmlBlockStart(P, i, pos, col, inPara) {
 function splitTableRow(s) {
   const cells = [];
   const n = s.length;
-  // Fast path: no code spans and no `\|` escapes — a plain split on `|`.
-  if (s.indexOf('`') < 0 && s.indexOf('\\|') < 0) {
+  // Fast path: no `\|` escapes — a plain split on `|`.
+  if (s.indexOf('\\|') < 0) {
     const parts = s.split('|');
     // A leading pipe (first part only whitespace) is not a cell; a
     // trailing pipe (last part only whitespace) is not a cell.
@@ -898,69 +900,35 @@ function splitTableRow(s) {
     for (let p = startIdx; p < endIdx; p++) cells.push(parts[p].trim());
     return cells;
   }
-  // Skip a leading pipe (and its following spaces are part of the cell).
-  let start = 0;
-  while (start < n && (s[start] === ' ' || s[start] === '\t')) start++;
-  if (s[start] === '|') start++;
-  // Collect cell spans as [from, to) plus any `|` unescapes inside them,
-  // then slice once per cell instead of concatenating char by char.
+  // Slow path: a `|` is a cell separator unless preceded by an ODD
+  // number of backslashes (then it is content, and the table layer
+  // consumes one backslash: `\|` -> `|`). Code spans do NOT protect a
+  // pipe in marked — `` `x | y` `` splits into two cells.
   const spans = [];
-  let cellStart = start;
-  // unescapes: list of [index, replacement] for `\|` -> `|` inside a span.
-  let unesc = [];
-  let i = start;
+  let cellStart = 0;
+  let i = 0;
   while (i < n) {
-    const c = s[i];
-    if (c === '`') {
-      let k = i;
-      while (k < n && s[k] === '`') k++;
-      const run = k - i;
-      const close = findCodeEnd(s, k, run);
-      if (close < 0) { i = k; continue; }
-      // Inside a code span, \| still becomes a literal | (the table
-      // layer consumes the escape); record those positions.
-      for (let q = k; q + 1 < close; q++) {
-        if (s[q] === '\\' && s[q + 1] === '|') unesc.push([q, '|']);
+    if (s[i] === '|') {
+      let bs = 0;
+      let q = i - 1;
+      while (q >= 0 && s[q] === '\\') { bs++; q--; }
+      if (bs % 2 === 0) {
+        spans.push([cellStart, i]);
+        cellStart = i + 1;
       }
-      i = close;
-      continue;
-    }
-    // Only \| is unescaped at the table layer; other escapes (\-, \\, ...)
-    // stay for the inline parser (so \--- is not a table delimiter).
-    if (c === '\\' && i + 1 < n && s[i + 1] === '|') {
-      unesc.push([i, '|']);
-      i += 2;
-      continue;
-    }
-    if (c === '|') {
-      spans.push([cellStart, i, unesc]);
-      unesc = [];
-      cellStart = i + 1;
-      i++;
-      continue;
     }
     i++;
   }
-  spans.push([cellStart, n, unesc]);
-  // Drop a trailing empty cell produced by a trailing pipe.
-  let end = n - 1;
-  while (end >= 0 && (s[end] === ' ' || s[end] === '\t')) end--;
-  if (s[end] === '|' && spans.length > 0) spans.pop();
-  for (const [from, to, ue] of spans) {
-    let cell = s.slice(from, to);
-    if (ue.length > 0) {
-      // Rebuild with `\|` -> `|` (offsets are relative to the span start).
-      let out = '';
-      let pos = 0;
-      for (const [idx] of ue) {
-        const rel = idx - from;
-        out += cell.slice(pos, rel) + '|';
-        pos = rel + 2;
-      }
-      out += cell.slice(pos);
-      cell = out;
-    }
-    cells.push(cell.trim());
+  spans.push([cellStart, n]);
+  // Drop a leading empty cell from a leading pipe and a trailing empty
+  // cell from a trailing pipe.
+  let lo = 0, hi = spans.length;
+  if (hi > 0 && s.slice(spans[0][0], spans[0][1]).trim() === '') lo = 1;
+  if (hi > lo && s.slice(spans[hi - 1][0], spans[hi - 1][1]).trim() === '') hi--;
+  if (lo >= hi) return spans.length === 1 ? [''] : [];
+  for (let p = lo; p < hi; p++) {
+    const raw = s.slice(spans[p][0], spans[p][1]);
+    cells.push(raw.trim().replace(/\\\|/g, '|'));
   }
   return cells;
 }
@@ -1256,7 +1224,17 @@ function parseBlocks(src, refs) {
           lazyContent = ' '.repeat(leftover) + lazyContent.slice(k);
         }
         const p = stack[stack.length - 1];
+        // A lazy `=`-only line (setext underline shape) after a lazy line
+        // is paragraph text with exactly 4 spaces prepended (cm-093);
+        // a setext underline cannot be a lazy continuation line, and
+        // marked pads it to 4 spaces. Only when the previous paragraph
+        // line was itself lazy; a `>`-marked previous line gets none.
+        if (p.lastLazy) {
+          const t = lazyContent.trim();
+          if (/^=+$/.test(t)) lazyContent = '    ' + t;
+        }
         p.lines.push(lazyContent);
+        p.lastLazy = true;
         lastBlank = false;
         i++;
         continue;
@@ -1274,6 +1252,7 @@ function parseBlocks(src, refs) {
       if (ws.length > 0 && stack.length > 0 && stack[stack.length - 1].t === 'para') {
         const p = stack[stack.length - 1];
         p.lines.push(ws);
+        p.lastLazy = false;
         lastBlank = false;
         i++;
         continue;
@@ -1391,6 +1370,7 @@ function parseBlocks(src, refs) {
         // A list marker that cannot interrupt is paragraph text.
         if (paraOpen) {
           stack[stack.length - 1].lines.push(content);
+          stack[stack.length - 1].lastLazy = false;
           lastBlank = false;
           i++;
           break;
@@ -1443,7 +1423,7 @@ function parseBlocks(src, refs) {
           }
         }
         // Start a paragraph.
-        const p = { t: 'para', lines: [content] };
+        const p = { t: 'para', lines: [content], lastLazy: false };
         addChild(p);
         stack.push(p);
         lastBlank = false;
@@ -1452,6 +1432,7 @@ function parseBlocks(src, refs) {
       }
       // Paragraph continuation.
       stack[stack.length - 1].lines.push(content);
+      stack[stack.length - 1].lastLazy = false;
       lastBlank = false;
       i++;
       break;
@@ -2588,7 +2569,17 @@ function parseTable(P, i, stack, hdr, del, content, ccol, lastBlank) {
   const n = P.lines.length;
   while (k < n) {
     const c = contentAt(P, k, stack);
-    if (!c || isBlankFrom(c.content, 0)) break;
+    if (!c) break;
+    // A line with exactly one tab is a table row of empty cells in
+    // marked (doc-02); two tabs or tab+space is a blank line.
+    if (c.content === '\t') {
+      const cells = [];
+      while (cells.length < hdr.length) cells.push('');
+      rows.push(cells);
+      k++;
+      continue;
+    }
+    if (isBlankFrom(c.content, 0)) break;
     // A line that starts a block (blockquote, heading, fence, ...) ends
     // the table; a bare line without `|` is still a one-cell row.
     if (startsInterruptingBlock(P, k, c.content, c.col, stack)) break;
@@ -2637,7 +2628,9 @@ function htmlBlockAt(P, i, content, ccol, inPara, stack) {
     }
     return last;
   }
-  const m1 = /^<\/?(script|pre|style|textarea)(?=[\s>\/]|$)/i.exec(rest);
+  // Type 1 starts only with the OPENING tag <pre>/<script>/<style>/
+  // <textarea>; a closing tag alone (</pre>) is paragraph text (cm-148).
+  const m1 = /^<(script|pre|style|textarea)(?=[\s>\/]|$)/i.exec(rest);
   if (m1) {
     const tag = m1[1].toLowerCase();
     return { type: 1, endLine: scanForRe(new RegExp('</' + tag + '\\s*>', 'i')) };
