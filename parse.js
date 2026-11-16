@@ -1398,6 +1398,18 @@ function parseBlocks(src, refs) {
         if (cc - col >= 4 || leftover > 0) {
           lazyContent = ' '.repeat(leftover) + lazyContent.slice(k);
         }
+        // A leading tab in lazy content expands to spaces (its width at
+        // the line's column), even when the indent is under 4 columns
+        // (doc-17/doc-40: `> \tindented` in a lazy paragraph line is 2
+        // spaces, not a literal tab). Spaces are kept verbatim.
+        {
+          let j = 0, c2 = col, out = '';
+          while (j < lazyContent.length && (lazyContent[j] === ' ' || lazyContent[j] === '\t')) {
+            if (lazyContent[j] === ' ') { out += ' '; c2++; j++; }
+            else { const w = 4 - (c2 % 4); out += ' '.repeat(w); c2 += w; j++; }
+          }
+          if (j > 0 && lazyContent.slice(0, j).includes('\t')) lazyContent = out + lazyContent.slice(j);
+        }
         const p = stack[stack.length - 1];
         // A lazy `=`-only line (setext underline shape) after a lazy line
         // is paragraph text with exactly 4 spaces prepended (cm-093);
