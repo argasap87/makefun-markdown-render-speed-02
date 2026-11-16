@@ -23,39 +23,19 @@ function isWhite(ch) { return ch === ' ' || ch === '\t'; }
 // Escape text for HTML output. When encode is false, an ampersand that
 // starts something looking like an entity (&word; or &#123; or &#x1f;) is
 // left alone, exactly as marked leaves it; < > " ' are always escaped.
+const ESC_RE = /&(?:#[0-9]+;|#[xX][0-9A-Fa-f]+;|[A-Za-z0-9_]+;)|[<>"'&]/g;
 function escText(s) {
   if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 &&
       s.indexOf('"') < 0 && s.indexOf("'") < 0) return s;
-  let out = '';
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '&') {
-      let j = i + 1;
-      if (s[j] === '#') {
-        j++;
-        if (s[j] === 'x' || s[j] === 'X') {
-          j++;
-          const st = j;
-          while (j < s.length && /[0-9A-Fa-f]/.test(s[j])) j++;
-          if (j > st && j <= i + 9 && s[j] === ';') { out += s.slice(i, j + 1); i = j; continue; }
-        } else {
-          const st = j;
-          while (j < s.length && isDigit(s[j])) j++;
-          if (j > st && j <= i + 9 && s[j] === ';') { out += s.slice(i, j + 1); i = j; continue; }
-        }
-      } else {
-        const st = j;
-        while (j < s.length && (isAlphaNum(s[j]) || s[j] === '_')) j++;
-        if (j > st && s[j] === ';') { out += s.slice(i, j + 1); i = j; continue; }
-      }
-      out += '&amp;';
-    } else if (c === '<') out += '&lt;';
-    else if (c === '>') out += '&gt;';
-    else if (c === '"') out += '&quot;';
-    else if (c === "'") out += '&#39;';
-    else out += c;
-  }
-  return out;
+  ESC_RE.lastIndex = 0;
+  return s.replace(ESC_RE, (m) => {
+    if (m === '&') return '&amp;';
+    if (m === '<') return '&lt;';
+    if (m === '>') return '&gt;';
+    if (m === '"') return '&quot;';
+    if (m === "'") return '&#39;';
+    return m; // a valid-looking entity: left alone.
+  });
 }
 
 // Escape where every & becomes &amp; (code spans, and the href/title of
@@ -901,14 +881,34 @@ function htmlBlockStart(P, i, pos, col, inPara) {
 // Returns null if the line has no cell separator context (caller decides).
 function splitTableRow(s) {
   const cells = [];
-  let cur = '';
-  let i = 0;
   const n = s.length;
+  // Fast path: no code spans and no `\|` escapes — a plain split on `|`.
+  if (s.indexOf('`') < 0 && s.indexOf('\\|') < 0) {
+    const parts = s.split('|');
+    // A leading pipe (first part only whitespace) is not a cell; a
+    // trailing pipe (last part only whitespace) is not a cell.
+    let startIdx = 0;
+    if (parts[0].trim() === '') startIdx = 1;
+    let endIdx = parts.length;
+    if (parts.length > 0 && parts[parts.length - 1].trim() === '') endIdx = parts.length - 1;
+    if (startIdx >= endIdx) {
+      // The whole row is whitespace (or just pipes): one empty cell.
+      return parts.length === 1 ? [''] : [];
+    }
+    for (let p = startIdx; p < endIdx; p++) cells.push(parts[p].trim());
+    return cells;
+  }
   // Skip a leading pipe (and its following spaces are part of the cell).
   let start = 0;
   while (start < n && (s[start] === ' ' || s[start] === '\t')) start++;
   if (s[start] === '|') start++;
-  i = start;
+  // Collect cell spans as [from, to) plus any `|` unescapes inside them,
+  // then slice once per cell instead of concatenating char by char.
+  const spans = [];
+  let cellStart = start;
+  // unescapes: list of [index, replacement] for `\|` -> `|` inside a span.
+  let unesc = [];
+  let i = start;
   while (i < n) {
     const c = s[i];
     if (c === '`') {
@@ -916,25 +916,53 @@ function splitTableRow(s) {
       while (k < n && s[k] === '`') k++;
       const run = k - i;
       const close = findCodeEnd(s, k, run);
-      if (close < 0) { cur += s.slice(i, k); i = k; continue; }
-      // Inside a code span, \| still becomes a literal | (the table layer
-      // consumes the escape); other backslashes stay literal.
-      cur += unescapePipe(s.slice(i, close));
+      if (close < 0) { i = k; continue; }
+      // Inside a code span, \| still becomes a literal | (the table
+      // layer consumes the escape); record those positions.
+      for (let q = k; q + 1 < close; q++) {
+        if (s[q] === '\\' && s[q + 1] === '|') unesc.push([q, '|']);
+      }
       i = close;
       continue;
     }
     // Only \| is unescaped at the table layer; other escapes (\-, \\, ...)
     // stay for the inline parser (so \--- is not a table delimiter).
-    if (c === '\\' && i + 1 < n && s[i + 1] === '|') { cur += '|'; i += 2; continue; }
-    if (c === '|') { cells.push(cur); cur = ''; i++; continue; }
-    cur += c; i++;
+    if (c === '\\' && i + 1 < n && s[i + 1] === '|') {
+      unesc.push([i, '|']);
+      i += 2;
+      continue;
+    }
+    if (c === '|') {
+      spans.push([cellStart, i, unesc]);
+      unesc = [];
+      cellStart = i + 1;
+      i++;
+      continue;
+    }
+    i++;
   }
-  cells.push(cur);
+  spans.push([cellStart, n, unesc]);
   // Drop a trailing empty cell produced by a trailing pipe.
   let end = n - 1;
   while (end >= 0 && (s[end] === ' ' || s[end] === '\t')) end--;
-  if (s[end] === '|' && cells.length > 0) cells.pop();
-  return cells.map((c) => c.trim());
+  if (s[end] === '|' && spans.length > 0) spans.pop();
+  for (const [from, to, ue] of spans) {
+    let cell = s.slice(from, to);
+    if (ue.length > 0) {
+      // Rebuild with `\|` -> `|` (offsets are relative to the span start).
+      let out = '';
+      let pos = 0;
+      for (const [idx] of ue) {
+        const rel = idx - from;
+        out += cell.slice(pos, rel) + '|';
+        pos = rel + 2;
+      }
+      out += cell.slice(pos);
+      cell = out;
+    }
+    cells.push(cell.trim());
+  }
+  return cells;
 }
 
 // In a table-cell fragment, \| becomes |; \\ stays \\ (so a following |
@@ -1567,6 +1595,16 @@ function renderItem(item, list, refs, out) {
 // Render inline markdown (a paragraph/heading/cell string) to HTML.
 function renderInline(text, refs) {
   if (!text) return '';
+  // Fast path: plain prose with no inline markers, no hard break
+  // (`  \n` or `\\\n`), and no autolink trigger. The only output is the
+  // escaped text (soft breaks stay as literal newlines).
+  if (text.indexOf('*') < 0 && text.indexOf('_') < 0 && text.indexOf('[') < 0 &&
+      text.indexOf(']') < 0 && text.indexOf('!') < 0 && text.indexOf('`') < 0 &&
+      text.indexOf('<') < 0 && text.indexOf('\\') < 0 && text.indexOf('~') < 0 &&
+      text.indexOf('://') < 0 && text.indexOf('www.') < 0 && text.indexOf('@') < 0 &&
+      text.indexOf('&#') < 0 && text.indexOf('  \n') < 0) {
+    return escText(text);
+  }
   return renderInlineNodes(parseInlineNodes(text, refs));
 }
 
@@ -1644,6 +1682,7 @@ function flanking(text, before, after) {
 
 // Parse inline markdown into a node list. Single left-to-right scan with a
 // delimiter stack for emphasis and links (CommonMark 0.31.2 algorithm).
+const INLINE_SPECIAL_RE = /[\\`*_~[\]<&\n]|!(?=\[)/g;
 function parseInlineNodes(text, refs) {
   const nodes = [];
   const delims = [];
@@ -1690,6 +1729,45 @@ function parseInlineNodes(text, refs) {
       }
       if (o < 0) { d += step; continue; }
       const opener = delims[o];
+      // Earlier-closer priority (pass 1 only): if an earlier closer C'
+      // (same kind, still active) has this opener as its nearest opener
+      // (any length), C' gets it first — a later closer must not steal
+      // an opener an earlier longer closer needs (doc-01 `**with *this
+      // be***` + `*so*version*?`: the `*` before `?` must not take the
+      // `*` opener the `***` closer needs).
+      // Earlier-closer priority (both passes): if an earlier PURE closer
+      // C' (same kind, still active, canClose but not canOpen) that is
+      // LONGER than this closer has this opener as its nearest opener
+      // (any length), C' gets it first — a later shorter closer must not
+      // steal an opener an earlier longer closer needs (doc-01 `**with
+      // *this be***` + `*so*version*?`: the `*` before `?` must not take
+      // the `*` opener the `***` closer needs). The longer-than rule
+      // keeps a same-length pairing from being blocked by a shorter
+      // dangling closer (`**a *b*c* d**`: the `*` after `c` must not
+      // reserve the `**` opener from the `**` closer). A middle
+      // delimiter that can also open (cm-412 `*foo**bar*`) does not
+      // reserve the opener.
+      {
+        let stolen = false;
+        for (let c2 = 0; c2 < d; c2++) {
+          const cl2 = delims[c2];
+          if (!cl2.active || cl2.kind !== closer.kind || !cl2.canClose || cl2.canOpen) continue;
+          if (cl2.len <= closer.len) continue;
+          // Nearest opener for cl2 (any length).
+          let o2 = -1;
+          for (let j = c2 - 1; j >= 0; j--) {
+            const op2 = delims[j];
+            if (!op2.active || op2.kind !== cl2.kind || !op2.canOpen) continue;
+            if (cl2.kind === '_' &&
+                ((op2.canOpen && op2.canClose) || (cl2.canOpen && cl2.canClose)) &&
+                (op2.len + cl2.len) % 3 === 0) continue;
+            o2 = j;
+            break;
+          }
+          if (o2 === o) { stolen = true; break; }
+        }
+        if (stolen) { d += step; continue; }
+      }
       const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
       const tag = closer.kind === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
       const opNode = opener.node;
@@ -1713,10 +1791,12 @@ function parseInlineNodes(text, refs) {
       nodes.splice(opIdx, clIdx - opIdx + 1, ...replacement);
       // Delimiters whose nodes were inside the em are now closed: remove
       // them from the stack (they cannot pair across the em boundary).
+      // A Set makes the membership test O(1) instead of O(children).
+      const childSet = new Set(children);
       for (let j = delims.length - 1; j >= 0; j--) {
         const dm = delims[j];
         if (dm === opener || dm === closer) continue;
-        if (dm.active && children.indexOf(dm.node) >= 0) {
+        if (dm.active && childSet.has(dm.node)) {
           delims.splice(j, 1);
           if (j < d) d--;
           if (j < o) o--;
@@ -1836,6 +1916,11 @@ function parseInlineNodes(text, refs) {
     const opIdx = nodes.indexOf(opNode);
     if (opIdx < 0) return -1;
     const textNodes = nodes.slice(opIdx + 1);
+    // A link's text cannot contain an explicit link, but a bare autolink
+    // inside it is just text (doc-01 `[private https://... method][ref]`
+    // keeps the URL literal inside the outer link). Flatten bare
+    // autolinks to their text before the explicit-link check.
+    flattenBareLinks(textNodes);
     // A link's text cannot contain a link. Check before touching the
     // delimiter stack, so a failed link leaves the stack intact.
     if (!isImg && containsLink(textNodes)) return -1;
@@ -1855,6 +1940,21 @@ function parseInlineNodes(text, refs) {
       nodes.push({ t: 'link', href, title, children: textNodes });
     }
     return endIdx;
+  }
+
+  // Replace bare-autolink nodes (flagged bare:true) with their plain
+  // text, in place, recursively. Used when a bare URL/email lands inside
+  // a link's text: it stays literal there.
+  function flattenBareLinks(list) {
+    for (let k = 0; k < list.length; k++) {
+      const nd = list[k];
+      if (nd.t === 'link' && nd.bare) {
+        const txt = plainText(nd.children);
+        list.splice(k, 1, { t: 'text', s: txt });
+      } else if (nd.children) {
+        flattenBareLinks(nd.children);
+      }
+    }
   }
 
   // Does any node in the list (recursively) contain a link?
@@ -2031,10 +2131,10 @@ function parseInlineNodes(text, refs) {
     }
     // Bare autolinks (scheme / www) and emails, at a word boundary.
     // Suppressed inside a raw <a>...</a> (inLink).
-    if (!inLink && (c === 'h' || c === 'f' || c === 'w' || c === 'm' || c === 'x') && (i === 0 || !isAlphaNum(text[i - 1]))) {
+    if (!inLink && (c === 'h' || c === 'H' || c === 'f' || c === 'F' || c === 'w' || c === 'W' || c === 'm' || c === 'M' || c === 'x' || c === 'X') && (i === 0 || !isAlphaNum(text[i - 1]))) {
       const auto = matchBareAutolink(text, i);
       if (auto) {
-        nodes.push({ t: 'link', href: auto.href, title: null, children: [{ t: 'text', s: auto.text }] });
+        nodes.push({ t: 'link', href: auto.href, title: null, bare: true, children: [{ t: 'text', s: auto.text }] });
         i = auto.end;
         continue;
       }
@@ -2042,14 +2142,41 @@ function parseInlineNodes(text, refs) {
     if (!inLink && isAlphaNum(c) && (i === 0 || !isEmailLocal(text[i - 1]))) {
       const em = matchEmail(text, i);
       if (em) {
-        nodes.push({ t: 'link', href: 'mailto:' + em.text, title: null, children: [{ t: 'text', s: em.text }] });
+        nodes.push({ t: 'link', href: 'mailto:' + em.text, title: null, bare: true, children: [{ t: 'text', s: em.text }] });
         i = em.end;
         continue;
       }
     }
-    // Plain text run up to the next special character. Autolinks are only
-    // checked at a word boundary (previous char not a word/email char), so
-    // a long plain run stays linear.
+    // Plain text run up to the next special character. First jump to
+    // the next special char with a regex; if the segment between here
+    // and there contains no autolink/email trigger, take it whole.
+    // Otherwise fall back to the per-char loop for this segment.
+    INLINE_SPECIAL_RE.lastIndex = i;
+    const sm = INLINE_SPECIAL_RE.exec(text);
+    const segEnd = sm ? sm.index : n;
+    if (!inLink) {
+      const seg = text.slice(i, segEnd);
+      // Cheap trigger check (native indexOf, not regex): an autolink or
+      // email can only start if one of these substrings is present.
+      if (seg.indexOf('@') < 0 && seg.indexOf('://') < 0 && seg.indexOf('www.') < 0 &&
+          seg.indexOf('mailto:') < 0 && seg.indexOf('xmpp:') < 0) {
+        let runText = seg;
+        if (segEnd < n && text[segEnd] === '\n') {
+          const m = / {2,}$/.exec(runText);
+          if (m) {
+            runText = runText.slice(0, runText.length - m[0].length);
+            addText(runText);
+            nodes.push({ t: 'br' });
+            i = segEnd + 1;
+            while (i < n && (text[i] === ' ' || text[i] === '\t')) i++;
+            continue;
+          }
+        }
+        addText(runText);
+        i = segEnd;
+        continue;
+      }
+    }
     let j = i;
     while (j < n) {
       const ch = text[j];
@@ -2057,7 +2184,7 @@ function parseInlineNodes(text, refs) {
           ch === '[' || ch === ']' || ch === '<' || ch === '&' || ch === '\n' ||
           (ch === '!' && text[j + 1] === '[')) break;
       const prev = j > 0 ? text[j - 1] : '';
-      if (!inLink && (ch === 'h' || ch === 'f' || ch === 'w' || ch === 'm' || ch === 'x') && !isAlphaNum(prev) &&
+      if (!inLink && (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F' || ch === 'w' || ch === 'W' || ch === 'm' || ch === 'M' || ch === 'x' || ch === 'X') && !isAlphaNum(prev) &&
           matchBareAutolink(text, j)) break;
       if (!inLink && isAlphaNum(ch) && !isEmailLocal(prev) && matchEmail(text, j)) break;
       j++;
@@ -2119,21 +2246,22 @@ function isEmailLocal(ch) {
 function matchBareAutolink(text, i) {
   if (i > 0 && isAlphaNum(text[i - 1])) return null;
   let scheme = null;
-  if (text.startsWith('http://', i)) scheme = 'http://';
-  else if (text.startsWith('https://', i)) scheme = 'https://';
-  else if (text.startsWith('ftp://', i)) scheme = 'ftp://';
-  else if (text.startsWith('mailto:', i)) {
+  const low = text.slice(i, i + 8).toLowerCase();
+  if (low.startsWith('http://')) scheme = text.slice(i, i + 7);
+  else if (low.startsWith('https://')) scheme = text.slice(i, i + 8);
+  else if (low.startsWith('ftp://')) scheme = text.slice(i, i + 6);
+  else if (low.startsWith('mailto:')) {
     // mailto:email — the whole `mailto:foo@bar.baz` is one link.
     const em = matchEmail(text, i + 7);
     if (!em) return null;
-    const url = 'mailto:' + em.text;
+    const url = text.slice(i, i + 7) + em.text;
     return { end: i + 7 + em.text.length, href: url, text: url };
-  } else if (text.startsWith('xmpp:', i)) {
+  } else if (low.startsWith('xmpp:')) {
     // xmpp:email[/resource] — one optional `/segment` resource.
     const em = matchEmail(text, i + 5);
     if (!em) return null;
     let end = i + 5 + em.text.length;
-    let url = 'xmpp:' + em.text;
+    let url = text.slice(i, i + 5) + em.text;
     if (text[end] === '/') {
       let k = end + 1;
       while (k < text.length) {
@@ -2173,6 +2301,16 @@ function matchBareAutolink(text, i) {
 // {end, text} or null.
 function matchEmail(text, i) {
   const n = text.length;
+  // Fast reject: an email needs an `@` within the current word (before
+  // the next space or special char). Scanning for `@` first avoids the
+  // full local-part parse for ordinary words.
+  let at = -1;
+  for (let q = i; q < n && q < i + 64; q++) {
+    const ch = text[q];
+    if (ch === '@') { at = q; break; }
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '<') break;
+  }
+  if (at < 0) return null;
   // Local part: letters, digits and . _ % + - (not starting/ending with .).
   let j = i;
   while (j < n) {
