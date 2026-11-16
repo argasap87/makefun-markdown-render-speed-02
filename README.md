@@ -1,5 +1,11 @@
 # markdown-render-speed-02
 
+[![make.fun · markdown-render-speed-02](https://make.fun/badge/markdown-render-speed-02.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![rank](https://make.fun/badge/markdown-render-speed-02/argasap87/makefun-markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+[![reward](https://make.fun/badge/markdown-render-speed-02/argasap87/makefun-markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
+
+Built for the [make.fun bounty](https://make.fun/bounty/markdown-render-speed-02) — referral code `1ae1r9cj`.
+
 A quick, dependency-free replacement for marked 18.1.3: `parse.js` turns
 CommonMark 0.31.2 + GFM into exactly the HTML marked produces with its
 default options, using a hand-built one-pass parser in place of marked's
