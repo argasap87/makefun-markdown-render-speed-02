@@ -1349,10 +1349,13 @@ function parseBlocks(src, refs) {
         continue; // re-run phase 2 inside the quote
       }
       if (!paraOpen) {
-        // Link reference definition (only at a paragraph start).
+        // Link reference definition (only at a paragraph start). A
+        // definition is a block: inside a list item that already holds a
+        // block, it loosens the list (cm-317).
         const def = tryDef2(P, i, content, stack);
         if (def) {
           if (!refs.has(def.label)) refs.set(def.label, { href: def.href, title: def.title });
+          markLoose(container(), lastBlank);
           i = def.endLine + 1;
           lastBlank = false;
           break;
@@ -1628,17 +1631,21 @@ function parseInlineNodes(text, refs) {
   // with `**` for strong and `*` with `*` for em); this keeps the inner
   // `**...**` in `*foo**bar**baz*` from being grabbed by the outer `*`.
   // Pass 2 falls back to any-length pairing for the cases that need it
-  // (e.g. `***foo***`, `*foo**`).
+  // (e.g. `***foo***`, `*foo**`), processing closers right to left so a
+  // longer closer (e.g. the `***` in `*foo**bar***`) splits across its
+  // openers before a shorter closer grabs one.
   function processEmphasis() {
-    processEmphasisPass(true);
-    processEmphasisPass(false);
+    processEmphasisPass(true, false);
+    processEmphasisPass(false, true);
   }
-  function processEmphasisPass(sameLengthOnly) {
-    let d = 0;
-    while (d < delims.length) {
+  function processEmphasisPass(sameLengthOnly, reverse) {
+    let d = reverse ? delims.length - 1 : 0;
+    const step = reverse ? -1 : 1;
+    const done = () => reverse ? d < 0 : d >= delims.length;
+    while (!done()) {
       const closer = delims[d];
       if (!closer.active || closer.kind === '[' || closer.kind === '![' ||
-          !closer.canClose) { d++; continue; }
+          !closer.canClose) { d += step; continue; }
       // Find the nearest opener before d (same length first in pass 1).
       let o = -1;
       for (let j = d - 1; j >= 0; j--) {
@@ -1651,7 +1658,7 @@ function parseInlineNodes(text, refs) {
         o = j;
         break;
       }
-      if (o < 0) { d++; continue; }
+      if (o < 0) { d += step; continue; }
       const opener = delims[o];
       const use = (opener.len >= 2 && closer.len >= 2) ? 2 : 1;
       const tag = closer.kind === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
@@ -1659,7 +1666,7 @@ function parseInlineNodes(text, refs) {
       const clNode = closer.node;
       const opIdx = nodes.indexOf(opNode);
       const clIdx = nodes.indexOf(clNode);
-      if (opIdx < 0 || clIdx < 0 || clIdx <= opIdx) { d++; continue; }
+      if (opIdx < 0 || clIdx < 0 || clIdx <= opIdx) { d += step; continue; }
       const children = nodes.slice(opIdx + 1, clIdx);
       // Consume `use` chars: opener takes from the end of its run, closer
       // from the start of its run.
@@ -1689,8 +1696,13 @@ function parseInlineNodes(text, refs) {
       if (closer.len === 0) {
         const ci = delims.indexOf(closer);
         if (ci >= 0) { delims.splice(ci, 1); if (ci < d) d--; }
+        // Forward scan: the next delimiter shifted into index d, so stay
+        // (it is examined next). Reverse scan: index d now holds an
+        // already-processed delimiter, so step left.
+        if (reverse) d += step;
       }
-      // Do not advance d: the same closer may pair again with its remainder.
+      // Otherwise the closer still has length left: stay at index d so it
+      // is re-examined and may pair again.
     }
   }
 
@@ -1712,7 +1724,20 @@ function parseInlineNodes(text, refs) {
     let href = null, title = null, endIdx = -1;
     if (text[j] === '(') {
       // Inline link: find the matching ')' (nested parens, escapes).
+      // A `<...>` destination may contain `)` (and `(`): skip the whole
+      // angle-bracket span so its parens do not affect the depth count.
       let k = j + 1, depth = 1;
+      let p = k;
+      while (p < n && (text[p] === ' ' || text[p] === '\t' || text[p] === '\n')) p++;
+      if (text[p] === '<') {
+        let q = p + 1;
+        while (q < n) {
+          if (text[q] === '\\' && q + 1 < n && isPunct(text[q + 1])) { q += 2; continue; }
+          if (text[q] === '>' || text[q] === '\n') break;
+          q++;
+        }
+        if (text[q] === '>') k = q + 1;
+      }
       while (k < n && depth > 0) {
         const c = text[k];
         if (c === '\\' && k + 1 < n && isPunct(text[k + 1])) { k += 2; continue; }
@@ -2015,7 +2040,8 @@ function parseInlineNodes(text, refs) {
 function parseLinkInner(inner) {
   let i = 0;
   while (i < inner.length && (inner[i] === ' ' || inner[i] === '\t' || inner[i] === '\n')) i++;
-  if (i >= inner.length) return null;
+  // An empty destination `()` is a valid link with an empty href.
+  if (i >= inner.length) return { href: '', title: null };
   const dest = parseDest(inner, i);
   if (!dest) return null;
   let href = dest.href;
