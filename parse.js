@@ -2877,6 +2877,14 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
     // indented up to 3 spaces (a list item at the enclosing list's
     // level). Plain text (e.g. `npm install ...`) is still absorbed.
     if (itemIndentFails && /^ {0,3}(?:[*+-]|\d{1,9}[.)])[ \t]/.test(raw)) break;
+    // An EMPTY fence in a list item ends at a line that fails the item's
+    // content indent: a column-0 line cannot be the fence's first
+    // content line (doc-17: `1. item` + `   ```toml` + `if previous` is
+    // an empty fence + a paragraph). Once the fence has content, such
+    // lines are absorbed as code (doc-05, cases A/C/E). A fence in a
+    // blockquote (no list item) still absorbs them (itemIndentFails is
+    // false there).
+    if (itemIndentFails && lines.length === 0) break;
     if (isFenceClose(raw, 0, 0, fence.ch, fence.len)) { k++; break; }
     lines.push(contentFromCol(raw, 0, fenceIndent));
     k++;
