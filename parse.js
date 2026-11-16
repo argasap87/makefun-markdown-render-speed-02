@@ -257,6 +257,37 @@ function parseTitle(s, i) {
 
 // Find the index just past the matching ']' for the '[' at s[start],
 // skipping code spans and escaped brackets. Returns -1 if none.
+// Does a link label (the raw text between `[` and `]`) contain an
+// unclosed code span under marked's LENIENT label scan? A backtick run
+// opens a span and the NEXT run (any length) closes it; a run of 2+
+// backticks at the very end of the label is consumed by marked's
+// `` ``+(?=\]) `` alternative and is not unclosed. An unclosed span
+// swallows the `]`, so the link does not form (doc-16/18/20/22/23:
+// `[at `` a ` b ``_]` and `[public updates `` a ` b `` in uses]`).
+function labelHasUnclosedSpan(label) {
+  let i = 0;
+  const n = label.length;
+  let inSpan = false;
+  while (i < n) {
+    if (label[i] === '`') {
+      let k = i;
+      while (k < n && label[k] === '`') k++;
+      if (!inSpan) {
+        if (k === n && k - i >= 2) return false;
+        inSpan = true;
+      } else {
+        inSpan = false;
+      }
+      i = k;
+    } else if (label[i] === '\\' && i + 1 < n) {
+      i += 2;
+    } else {
+      i++;
+    }
+  }
+  return inSpan;
+}
+
 function findLabelEnd(s, start) {
   // A label ends at the FIRST unescaped `]` (code spans aside). Nested
   // brackets do NOT extend it: `[ref[bar]]` has label `ref[bar`, so it
@@ -2019,6 +2050,11 @@ function parseInlineNodes(text, refs) {
     if (di < 0) return -1;
     const opener = delims[di];
     const isImg = opener.kind === '![';
+    // A `]` inside an unclosed code span (marked's lenient label scan)
+    // does not end the label, so no link forms. Scan only the label
+    // text (opener..closeIdx), never past the `]`, so a backtick in the
+    // destination cannot confuse it.
+    if (labelHasUnclosedSpan(text.slice(opener.src + 1, closeIdx))) return -1;
     // Parse what follows the ']'.
     let j = closeIdx + 1;
     let href = null, title = null, endIdx = -1;
@@ -2698,8 +2734,11 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
   const lines = [];
   let k = i + 1;
   const n = P.lines.length;
-  // The fence's own indent is stripped from every code line.
-  const fenceIndent = indentOf(content, 0, ccol).col - ccol;
+  // The fence's own indent is stripped from every code line — but only
+  // for BACKTICK fences. A TILDE fence never dedents its content in
+  // marked (doc-22: `~~~typescript` keeps the 3 spaces of its content
+  // line; a ``` fence at the same indent strips them).
+  const fenceIndent = fence.ch === '~' ? 0 : indentOf(content, 0, ccol).col - ccol;
   while (k < n) {
     const c = contentAt(P, k, stack);
     if (c) {
@@ -2734,7 +2773,19 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank, lastBlankDept
           if (markers < quotesInStack) break;
         }
       }
-      lines.push(contentFromCol(c.content, c.col, c.col + fenceIndent));
+      let line = contentFromCol(c.content, c.col, c.col + fenceIndent);
+      // A leading tab in the dedented content expands to spaces when the
+      // fence is inside a container (doc-22: `>   \tindented` in a
+      // ```rust fence becomes 4 spaces; at top level the tab is kept).
+      if (stack.length > 1 && line.length > 0 && (line[0] === '\t' || line[0] === ' ')) {
+        let out = '', col = 0, j = 0;
+        while (j < line.length && (line[j] === ' ' || line[j] === '\t')) {
+          if (line[j] === ' ') { out += ' '; col++; j++; }
+          else { const w = 4 - (col % 4); out += ' '.repeat(w); col += w; j++; }
+        }
+        if (j > 0 && line.slice(0, j).includes('\t')) line = out + line.slice(j);
+      }
+      lines.push(line);
       k++;
       continue;
     }
