@@ -2583,6 +2583,31 @@ function parseFenced(P, i, stack, fence, content, ccol, lastBlank) {
     const c = contentAt(P, k, stack);
     if (c) {
       if (isFenceClose(c.content, 0, c.col, fence.ch, fence.len)) { k++; break; }
+      // A blank line that is missing a BLOCKQUOTE marker ends the
+      // blockquote — and a fence inside it — instead of becoming an
+      // empty code line (doc-06 `>` with no inner `> > `). contentAt
+      // stops stripping at a blank, so count the `>` markers the raw
+      // line actually has vs the quote containers in the stack. A
+      // blank line missing only a LIST indent is still fence content
+      // (doc-02), so list items are not counted here.
+      if (c.content.trim() === '' && !/^[ \t]*$/.test(P.lines[k])) {
+        let quotesInStack = 0;
+        for (let s = 1; s < stack.length; s++) {
+          if (stack[s].t === 'para') break;
+          if (stack[s].t === 'quote') quotesInStack++;
+        }
+        if (quotesInStack > 0) {
+          const raw = P.lines[k];
+          let markers = 0, p = 0;
+          while (p < raw.length) {
+            let sp = 0;
+            while (p < raw.length && sp < 3 && raw[p] === ' ') { p++; sp++; }
+            if (p < raw.length && raw[p] === '>') { markers++; p++; if (raw[p] === ' ') p++; else if (raw[p] === '\t') p++; }
+            else break;
+          }
+          if (markers < quotesInStack) break;
+        }
+      }
       lines.push(contentFromCol(c.content, c.col, c.col + fenceIndent));
       k++;
       continue;
